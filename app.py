@@ -1,36 +1,18 @@
 """Gemelo digital consultivo para mantenimiento (TPM) · CNC plasma y torno.
 
-Propuesta académica evaluada por simulación (Monte Carlo). Las señales son
-sintéticas y se generan a partir de la línea base del diagnóstico; al implementar
-la propuesta, el generador de señales se reemplaza por la lectura del gateway
-(MQTT / OPC UA) y el resto de la plataforma no cambia.
+Las señales son sintéticas y se generan a partir de la línea base del diagnóstico. Para operar con
+datos reales, `run_simulation` se sustituye por la lectura del gateway (MQTT / OPC UA); el resto de la
+plataforma no cambia.
 
-Versión 1.5: captura del error de posición por inspección TPM, perfil normal aprendido con recalibración tras la intervención,
-variación de carga operativa y compensación de régimen (todo desactivado por defecto: las cifras del TSP no cambian).
-
-Versión 1.4: puntos de medición según las fallas del historial, clasificación de esas fallas y controles con decimales.
-Los valores por defecto reproducen las cifras del TSP (+35 % MTBF, −35 % MTTR, 1,000 corridas, semilla 42).
-Alternativa: +38.4 % / −36.2 % equivale al escenario moderado de Arena; hasta 10,000 corridas reducen el error de muestreo.
-
-Versión 1.3: franja de estado en el tiempo, análisis de la detección (anticipación y falsas alarmas)
-y panel de sustento del supuesto de MTBF.
-
-Versión 1.2: la réplica virtual se reconstruye a partir de fotos de los equipos reales
-(pórtico CNC con fuente de plasma y controlador; torno horizontal) con dimensiones estimadas.
-
-Cambios de la versión 1.1 respecto al código original:
-  - Sin el nombre de la empresa (títulos, pie, archivos descargables).
-  - Nueva pestaña "Réplica virtual" (modelo 3D esquemático con sensores y ficha de datos).
-  - Valores por defecto iguales a los del TSP (falla acelerada, 1,000 corridas Monte Carlo).
-  - Indicadores con IC 95 %, tabla de criterios de aceptación y pestaña de sensibilidad.
-  - Insignias por estado (antes todas salían en verde) y manejo de lecturas perdidas.
-  - Resultados en caché (la app ya no recalcula todo al mover un control).
-  - Botón para restaurar los valores del TSP (reemplaza al botón "Ejecutar", que no hacía nada).
-  - Opción de detección "estimada desde lecturas de sensores" con persistencia real de 4 intervalos.
-  - La numérica de la simulación en el modo "versión del TSP" es idéntica a la original.
+Ejecución:  streamlit run app.py
 """
-import json
+from dataclasses import dataclass
+from dataclasses import replace
 from datetime import datetime
+import json
+from types import SimpleNamespace
+from typing import Callable
+from typing import NamedTuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -38,20 +20,41 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-APP_VERSION = "1.5"
+
+# ===========================================================================
+# CONFIG
+# ===========================================================================
+
+APP_VERSION = "1.6"
 APP_TITLE = "Gemelos Digitales · TPM"
 
-# Metas del TSP
+# Metas de aceptación
 META_DISPONIBILIDAD = 90.36  # %  (≥)
 META_MTBF = 43.86            # h  (>)
 META_CALIDAD_DATOS = 95.0    # %  (≥)
 
+# Resolución temporal: una lectura cada cinco minutos simulados
+SAMPLES_PER_HOUR = 12
+THERMAL_INERTIA_SAMPLES = 24    # ventana de la inercia térmica de la carga (2 h)
+PERSISTENCE_INTERVALS = 4       # lecturas seguidas por encima del umbral para proponer intervenir
+LEARN_H = 4.0                   # horas con las que el gemelo aprende (o recalibra) el perfil normal
+
+# Semillas base de los análisis con muchas trayectorias
+SEED_FAILING = 5000
+SEED_NORMAL = 9000
+SEED_STEP_EXPERIMENT = 17
+
+POLICIES = ("Reactivo", "Predictivo")
 SCENARIOS = ["Operación normal", "Desgaste progresivo", "Falla acelerada"]
-DETECCION_TSP = "Estado simulado (versión del TSP)"
+DETECCION_ESTADO = "Estado interno del simulador"
 DETECCION_LECTURAS = "Estimado desde lecturas de sensores"
-CAPTURA_CONTINUA = "Continua cada 5 min (versión del TSP)"
+CAPTURA_CONTINUA = "Continua cada 5 min"
 CAPTURA_INSPECCION = "Por inspección TPM"
-LEARN_H = 4.0   # horas con las que el gemelo aprende (o recalibra) el perfil normal en el método por lecturas
+
+# Vistas principales (navegación)
+VIEWS = ["📡 Telemetría", "🧊 Réplica virtual", "📊 Indicadores", "📈 Sensibilidad",
+         "⚠️ Alertas", "🧪 Pruebas", "🛠️ Implementación", "📘 Metodología"]
+
 
 # Sensibilidad de cada variable a la carga operativa: a plena carga y con variación de 100 %, la lectura sube
 # (o baja, en el RPM) esta fracción del tramo entre el valor base y el límite crítico.
@@ -59,7 +62,7 @@ LOAD_SENS = {"Vibración (mm/s RMS)": 0.9, "Temperatura (°C)": 0.7, "Corriente 
              "Error de posición (mm)": 0.0}
 
 # Modos de falla: qué variables muestran la degradación (según las fallas del historial). El resto no se mueve.
-MODO_TODAS = "Todas las variables (versión del TSP)"
+MODO_TODAS = "Todas las variables"
 MODOS_FALLA = {
     MODO_TODAS: None,
     "Solo error de posición (holgura, descalibración)": ["Error de posición (mm)"],
@@ -67,20 +70,20 @@ MODOS_FALLA = {
     "Corriente y temperatura (servomotor)": ["Corriente (A)", "Temperatura (°C)"],
 }
 
-# Valores por defecto = configuración principal documentada en el TSP
+# Valores por defecto de los controles
 DEFAULTS = {
     "asset_name": "CNC plasma",
     "scenario": "Falla acelerada",
     "policy": "Reactivo",
     "duration": 48,
     "seed": 42,
-    "mtbf_gain": 35.0,       # supuesto con el que se obtuvieron las cifras del TSP
+    "mtbf_gain": 35.0,       # supuesto con el que se obtuvieron las cifras de referencia
     "mttr_reduction": 35.0,
-    "simulations": 1000,     # corridas del Monte Carlo del TSP (opciones: hasta 10,000)
+    "simulations": 1000,     # corridas del Monte Carlo de referencia (opciones: hasta 10,000)
     "noise_factor": 1.0,
     "missing_rate_pct": 2,
     "intervention_pct": 66,
-    "detection": DETECCION_TSP,
+    "detection": DETECCION_ESTADO,
     "p_prog": 70,            # historial: 10 de 14 fallas con degradación progresiva (71 %)
     "position_capture": CAPTURA_CONTINUA,
     "inspection_h": 8,
@@ -92,53 +95,10 @@ DEFAULTS = {
 
 LEVEL_COLOR = {"Normal": "#34d399", "Advertencia": "#fbbf24", "Crítico": "#fb7185", "Sin dato": "#64748b"}
 
-st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="⚙️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
-st.markdown(
-    """
-    <style>
-      .stApp {background: #07111e; color: #e7eef7;}
-      [data-testid="stSidebar"] {background: #0a1928; border-right: 1px solid rgba(255,255,255,.08);}
-      [data-testid="stMetric"] {background: #0c1d2d; border: 1px solid rgba(255,255,255,.09); border-radius: 14px; padding: 16px;}
-      [data-testid="stMetricLabel"] {color: #91a4b8;}
-      [data-testid="stMetricValue"] {color: #f6fbff;}
-      .block-container {padding-top: 1.6rem; max-width: 1500px;}
-      .hero {padding: 20px 24px; border: 1px solid rgba(34,211,238,.20); border-radius: 18px;
-             background: radial-gradient(circle at 82% 0%, rgba(34,211,238,.13), transparent 38%), #0b1a2a; margin-bottom: 18px;}
-      .eyebrow {color:#67e8f9; font-size:.76rem; font-weight:800; letter-spacing:.18em; text-transform:uppercase;}
-      .hero h1 {font-size:2.15rem; margin:.25rem 0; color:#f8fafc;}
-      .hero p {color:#94a3b8; margin:0;}
-      .demo-note {border:1px solid rgba(251,191,36,.22); background:rgba(251,191,36,.07); color:#fde68a;
-                  border-radius:12px; padding:10px 14px; font-size:.88rem; margin-bottom:16px;}
-      .status-card {border-radius:16px; padding:18px; border:1px solid rgba(255,255,255,.09); background:#0b1a2a; min-height:155px;}
-      .status-normal {box-shadow: inset 4px 0 #34d399;}
-      .status-warning {box-shadow: inset 4px 0 #fbbf24;}
-      .status-critical {box-shadow: inset 4px 0 #fb7185;}
-      .machine-name {color:#f8fafc; font-size:1.18rem; font-weight:750;}
-      .machine-meta {color:#7f94a9; font-size:.82rem; margin-top:2px;}
-      .status-pill {display:inline-block; margin-top:18px; padding:5px 10px; border-radius:999px; font-size:.75rem; font-weight:800; letter-spacing:.07em;}
-      .pill-normal {background:rgba(52,211,153,.13); color:#6ee7b7;}
-      .pill-warning {background:rgba(251,191,36,.13); color:#fde68a;}
-      .pill-critical {background:rgba(251,113,133,.13); color:#fda4af;}
-      .reading {border-radius:14px; padding:14px 16px; background:#0c1d2d; border:1px solid rgba(255,255,255,.09); min-height:112px;}
-      .reading-label {color:#91a4b8; font-size:.84rem;}
-      .reading-value {color:#f6fbff; font-size:2rem; font-weight:700; line-height:1.25;}
-      .reading-meta {color:#8296aa; font-size:.78rem;}
-      .legend-dot {display:inline-block; width:10px; height:10px; border-radius:50%; margin:0 5px 0 12px;}
-      .section-title {font-size:1.05rem; font-weight:750; color:#f8fafc; margin:8px 0 4px;}
-      .small-muted {color:#8296aa; font-size:.83rem;}
-      div[data-testid="stDataFrame"] {border:1px solid rgba(255,255,255,.08); border-radius:12px; overflow:hidden;}
-      .stButton > button {border-radius:10px; font-weight:700;}
-      hr {border-color:rgba(255,255,255,.08)!important;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# ===========================================================================
+# ASSETS
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
 # Activos, variables y umbrales (los umbrales de vibración, temperatura y corriente
@@ -175,7 +135,7 @@ ASSETS = {
 }
 
 # Qué toma el gemelo de cada variable: sensor, ubicación y origen del dato
-# (según la tabla de instrumentación del TSP).
+# (según la tabla de instrumentación).
 SENSOR_INFO = {
     "CNC plasma": {
         "Vibración (mm/s RMS)": ("Acelerómetro triaxial IEPE o RS-485, IP67 (1 punto base y 1 de contingencia)", "Accionamiento del eje X (base) y carro del eje Y (contingencia)", "Gateway (MQTT u OPC UA)"),
@@ -218,18 +178,155 @@ COBERTURA_BASE = ["Plena", "Plena", "Plena", "Plena", "Plena", "Parcial", "Plena
                   "Sin cobertura", "Plena", "Parcial", "Plena", "Plena", "Sin cobertura", "Plena"]
 
 # ---------------------------------------------------------------------------
-# Cálculo base
+# Fichas de los equipos. Las dimensiones son nominales: confirmar con la medición en planta.
 # ---------------------------------------------------------------------------
+EQUIPMENT_SPECS = {
+    "CNC plasma": [
+        ("Tipo de máquina", "Pórtico CNC de corte por plasma y oxicorte, con rieles laterales y mesa de parrilla", "Rótulo del equipo"),
+        ("Fabricante (rótulo en la viga)", "«… Buluoer Intelligence»; modelo por confirmar", "Rótulo del equipo"),
+        ("Controlador", "Fangling F2300BT: 2 ejes, salida de pulsos y dirección a los drivers, sin realimentación de posición; control de altura de antorcha por tensión de arco; USB y RS-232; hasta 15 m/min", "Rótulo + manual de la serie F2000"),
+        ("Fuente de plasma", "LGK-200 IGBT: inversor trifásico de 380 V, clase 200 A; los catálogos difieren en corriente nominal y ciclo de trabajo", "Rótulo + catálogos de la serie LGK"),
+        ("Antorchas", "Dos antorchas en el carro (plasma y oxicorte); selector Plasma/Llama en el panel", "Rótulo del equipo"),
+        ("Área de corte y dimensiones", "Unos 3 m de luz de pórtico y 6 m de recorrido", "Nominal: confirmar en planta"),
+        ("Fallas del historial", "8 fallas: 5 en el eje X y 3 en el eje Y", "Registro de fallas"),
+        ("Datos del controlador (modelos «T»)", "Contadores de perforaciones, piezas, distancia y tiempo de corte, y tiempo de funcionamiento", "Manual de la serie F2000: verificar en la unidad"),
+    ],
+    "Torno": [
+        ("Tipo de máquina", "Torno paralelo horizontal manual de bancada larga, con plato de garras, portaherramientas de 4 posiciones y contrapunto", "Rótulo del equipo"),
+        ("Fabricante (rótulo)", "TOPTECH; modelo por confirmar", "Rótulo del equipo"),
+        ("Placa de características", "Pendiente: registrar modelo, potencia, tensión y número de serie", "Por levantar en planta"),
+        ("Velocidad del husillo", "Se selecciona con palancas; el panel indica límites de «≤ 500 r/min» y «≤ 600 r/min» junto a pictogramas de plato", "Rótulo del equipoo: verificar"),
+        ("Fallas del historial", "6 fallas: 2 en cabezal y caja de velocidades, 3 en carro, torreta y bancada, 1 en el contrapunto", "Registro de fallas"),
+        ("Dimensiones", "Unos 3.6 m de largo, 1.4 m de fondo y 1.6 m de alto", "Nominal: confirmar en planta"),
+    ],
+}
+
+
+# ===========================================================================
+# THEME
+# ===========================================================================
+
+PAPER_BG = "#0b1a2a"
+PLOT_BG = "#081522"
+FONT_COLOR = "#b8c7d9"
+GRID_COLOR = "rgba(255,255,255,.06)"
+THEME = dict(paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG, font_color=FONT_COLOR)
+PLOTLY_CONFIG = {"displaylogo": False}
+PLOTLY_CONFIG_BARE = {"displaylogo": False, "displayModeBar": False}
+
+
+def inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+          .stApp {background: #07111e; color: #e7eef7;}
+          [data-testid="stSidebar"] {background: #0a1928; border-right: 1px solid rgba(255,255,255,.08);}
+          [data-testid="stMetric"] {background: #0c1d2d; border: 1px solid rgba(255,255,255,.09); border-radius: 14px; padding: 16px;}
+          [data-testid="stMetricLabel"] {color: #91a4b8;}
+          [data-testid="stMetricValue"] {color: #f6fbff;}
+          .block-container {padding-top: 1.6rem; max-width: 1500px;}
+          .hero {padding: 20px 24px; border: 1px solid rgba(34,211,238,.20); border-radius: 18px;
+                 background: radial-gradient(circle at 82% 0%, rgba(34,211,238,.13), transparent 38%), #0b1a2a; margin-bottom: 18px;}
+          .eyebrow {color:#67e8f9; font-size:.76rem; font-weight:800; letter-spacing:.18em; text-transform:uppercase;}
+          .hero h1 {font-size:2.15rem; margin:.25rem 0; color:#f8fafc;}
+          .hero p {color:#94a3b8; margin:0;}
+          .demo-note {border:1px solid rgba(251,191,36,.22); background:rgba(251,191,36,.07); color:#fde68a;
+                      border-radius:12px; padding:10px 14px; font-size:.88rem; margin-bottom:16px;}
+          .status-card {border-radius:16px; padding:18px; border:1px solid rgba(255,255,255,.09); background:#0b1a2a; min-height:155px;}
+          .status-normal {box-shadow: inset 4px 0 #34d399;}
+          .status-warning {box-shadow: inset 4px 0 #fbbf24;}
+          .status-critical {box-shadow: inset 4px 0 #fb7185;}
+          .machine-name {color:#f8fafc; font-size:1.18rem; font-weight:750;}
+          .machine-meta {color:#7f94a9; font-size:.82rem; margin-top:2px;}
+          .status-pill {display:inline-block; margin-top:18px; padding:5px 10px; border-radius:999px; font-size:.75rem; font-weight:800; letter-spacing:.07em;}
+          .pill-normal {background:rgba(52,211,153,.13); color:#6ee7b7;}
+          .pill-warning {background:rgba(251,191,36,.13); color:#fde68a;}
+          .pill-critical {background:rgba(251,113,133,.13); color:#fda4af;}
+          .reading {border-radius:14px; padding:14px 16px; background:#0c1d2d; border:1px solid rgba(255,255,255,.09); min-height:112px;}
+          .reading-label {color:#91a4b8; font-size:.84rem;}
+          .reading-value {color:#f6fbff; font-size:2rem; font-weight:700; line-height:1.25;}
+          .reading-meta {color:#8296aa; font-size:.78rem;}
+          .legend-dot {display:inline-block; width:10px; height:10px; border-radius:50%; margin:0 5px 0 12px;}
+          .section-title {font-size:1.05rem; font-weight:750; color:#f8fafc; margin:8px 0 4px;}
+          .small-muted {color:#8296aa; font-size:.83rem;}
+          div[data-testid="stDataFrame"] {border:1px solid rgba(255,255,255,.08); border-radius:12px; overflow:hidden;}
+          .stButton > button {border-radius:10px; font-weight:700;}
+          hr {border-color:rgba(255,255,255,.08)!important;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ===========================================================================
+# METRICS
+# ===========================================================================
+
 def base_metrics(asset):
+    """Devuelve (horas operativas, MTBF, MTTR, disponibilidad %) del periodo diagnóstico."""
+    failures = asset["failures"]
+    if failures <= 0:
+        raise ValueError(f"{asset.get('code', 'activo')}: se requiere al menos una falla en el historial")
     operating = asset["scheduled_hours"] - asset["downtime_hours"]
-    mtbf = operating / asset["failures"]
-    mttr = asset["downtime_hours"] / asset["failures"]
-    availability = mtbf / (mtbf + mttr) * 100
-    return operating, mtbf, mttr, availability
+    mtbf = operating / failures
+    mttr = asset["downtime_hours"] / failures
+    return operating, mtbf, mttr, availability_pct(mtbf, mttr)
 
 
 def availability_pct(mtbf, mttr):
     return mtbf / (mtbf + mttr) * 100
+
+
+# ===========================================================================
+# TELEMETRY
+# ===========================================================================
+
+@dataclass(frozen=True)
+class SimConfig:
+    """Parámetros de una corrida de telemetría (inmutable y hashable: sirve como llave de caché)."""
+
+    asset_name: str
+    scenario: str
+    duration: float = 48
+    seed: int = 42
+    noise_factor: float = 1.0
+    missing_rate: float = 0.0
+    intervention_threshold: float = 0.66
+    detection: str = DETECCION_ESTADO
+    evaluate_normal: bool = False
+    load_variability: float = 0.0
+    compensate_load: bool = False
+    inspection_h: float = 0.0
+    failure_mode: str = MODO_TODAS
+
+    def __post_init__(self):
+        if self.asset_name not in ASSETS:
+            raise ValueError(f"Activo desconocido: {self.asset_name!r}")
+        if self.scenario not in SCENARIOS:
+            raise ValueError(f"Escenario desconocido: {self.scenario!r}")
+        if self.failure_mode not in MODOS_FALLA:
+            raise ValueError(f"Modo de falla desconocido: {self.failure_mode!r}")
+        if self.duration <= 0:
+            raise ValueError("La duración debe ser positiva")
+        if not 0.0 <= self.missing_rate <= 0.5:
+            raise ValueError("missing_rate debe estar entre 0 y 0.5")
+        if not 0.0 <= self.load_variability <= 1.0:
+            raise ValueError("load_variability debe estar entre 0 y 1")
+        if self.inspection_h < 0:
+            raise ValueError("inspection_h no puede ser negativo")
+
+
+class Telemetry(NamedTuple):
+    """Resultado de una corrida, sin pandas."""
+
+    hours: np.ndarray
+    degradation: np.ndarray              # fracción 0-1.1
+    observed: dict                       # variable -> lecturas (NaN = dato perdido)
+    statuses: np.ndarray                 # "Normal" | "Advertencia" | "Crítico"
+    intervention_index: Optional[int]
+    alerts: list                         # vacío si full=False
+    condition_pct: Optional[np.ndarray]  # None si full=False
+    profile: Optional[np.ndarray]        # None si full=False
 
 
 def degradation_curve(points, scenario, rng):
@@ -246,10 +343,10 @@ def degradation_curve(points, scenario, rng):
 def learned_baseline(observed, asset, start, length):
     """Perfil normal aprendido: mediana de cada variable en una ventana de lecturas."""
     out = {}
-    for variable, cfg in asset["variables"].items():
+    for variable, spec in asset["variables"].items():
         window = np.asarray(observed[variable][start:start + length], dtype=float)
         window = window[~np.isnan(window)]
-        out[variable] = float(np.median(window)) if len(window) >= 3 else cfg["base"]
+        out[variable] = float(np.median(window)) if len(window) >= 3 else spec["base"]
     return out
 
 
@@ -258,84 +355,78 @@ def condition_index(observed, asset, baseline=None):
     (0 = perfil normal, 1 = límite crítico) entre las variables, suavizada con mediana de 3.
     Sin `baseline` usa las constantes del diagnóstico; con `baseline`, el perfil normal aprendido."""
     parts = []
-    for variable, cfg in asset["variables"].items():
+    for variable, spec in asset["variables"].items():
         values = np.asarray(observed[variable], dtype=float)
-        base = cfg["base"] if baseline is None else baseline[variable]
-        if cfg["direction"] == "high":
-            parts.append((values - base) / max(cfg["critical"] - base, 1e-9))
+        base = spec["base"] if baseline is None else baseline[variable]
+        if spec["direction"] == "high":
+            parts.append((values - base) / max(spec["critical"] - base, 1e-9))
         else:
-            parts.append((base - values) / max(base - cfg["critical"], 1e-9))
-    raw = pd.DataFrame(np.vstack(parts).T).max(axis=1, skipna=True)
-    return raw.rolling(3, min_periods=1).median().to_numpy()
+            parts.append((base - values) / max(base - spec["critical"], 1e-9))
+    raw = np.fmax.reduce(np.vstack(parts), axis=0)  # ignora NaN, igual que el máximo de pandas
+    return pd.Series(raw).rolling(3, min_periods=1).median().to_numpy()
 
 
-def persistent_hit(above, intervals=4):
+def persistent_hit(above, intervals=PERSISTENCE_INTERVALS):
     """Primer instante en que la condición se mantiene durante `intervals` lecturas seguidas."""
     run = pd.Series(above.astype(int)).rolling(intervals).sum().to_numpy()
     hits = np.where(run >= intervals)[0]
     return int(hits[0]) if len(hits) else None
 
 
-def _simulate_core(
-    asset_name,
-    scenario,
-    policy,
-    duration,
-    seed,
-    noise_factor=1.0,
-    missing_rate=0.0,
-    intervention_threshold=0.66,
-    detection=DETECCION_TSP,
-    evaluate_normal=False,
-    load_variability=0.0,
-    compensate_load=False,
-    inspection_h=0.0,
-    failure_mode=MODO_TODAS,
-):
+def run_simulation(sim: SimConfig, policy: str, full: bool = True) -> Telemetry:
     """Genera la telemetría simulada de un equipo.
 
-    load_variability: fracción 0-0.5 de variación de la carga operativa (0 = sin variación).
+    policy: "Reactivo" (sin intervención) o "Predictivo" (el gemelo propone intervenir).
+    full: si es False se omiten alertas, índice de condición y perfil (suficiente para los análisis
+        que solo necesitan los estados y la hora de intervención).
+    load_variability: fracción 0-1 de variación de la carga operativa (0 = sin variación).
     compensate_load: el gemelo descuenta el régimen de carga (perfil normal por régimen); el régimen se conoce
         de forma imperfecta, por lo que queda 20 % del efecto.
     inspection_h: horas entre inspecciones TPM para las variables manuales (0 = captura continua cada 5 min).
     failure_mode: variables que muestran la degradación (MODOS_FALLA); por defecto, todas.
-    Con los valores por defecto el resultado es idéntico al de la versión original.
     """
+    if policy not in POLICIES:
+        raise ValueError(f"Política desconocida: {policy!r}")
+    asset_name, scenario, duration, seed = sim.asset_name, sim.scenario, sim.duration, sim.seed
+    noise_factor, missing_rate = sim.noise_factor, sim.missing_rate
+    intervention_threshold, detection = sim.intervention_threshold, sim.detection
+    evaluate_normal, load_variability = sim.evaluate_normal, sim.load_variability
+    compensate_load, inspection_h, failure_mode = sim.compensate_load, sim.inspection_h, sim.failure_mode
     asset = ASSETS[asset_name]
     rng = np.random.default_rng(seed)
-    points = int(duration * 12) + 1  # una lectura cada cinco minutos simulados
+    points = int(duration * SAMPLES_PER_HOUR) + 1
     hours = np.linspace(0, duration, points)
     degradation = degradation_curve(points, scenario, rng)
 
     # El ruido y las pérdidas de datos se sortean en el mismo orden que la versión original.
     noise, missing = {}, {}
-    for variable, cfg in asset["variables"].items():
-        noise[variable] = rng.normal(0, cfg["noise"] * noise_factor, points)
+    for variable, spec in asset["variables"].items():
+        noise[variable] = rng.normal(0, spec["noise"] * noise_factor, points)
         missing[variable] = rng.random(points) < missing_rate
 
     # Variación de carga operativa, con semilla propia para no alterar las demás señales.
     load_effect = {variable: 0.0 for variable in asset["variables"]}
     if load_variability > 0:
         rng_load = np.random.default_rng(seed + 7)
-        load = np.repeat(rng_load.uniform(0, 1, int(np.ceil(points / 12)) + 1), 12)[:points]
-        thermal = pd.Series(load).rolling(24, min_periods=1).mean().to_numpy()  # inercia térmica
-        for variable, cfg in asset["variables"].items():
+        load = np.repeat(rng_load.uniform(0, 1, int(np.ceil(points / SAMPLES_PER_HOUR)) + 1), SAMPLES_PER_HOUR)[:points]
+        thermal = pd.Series(load).rolling(THERMAL_INERTIA_SAMPLES, min_periods=1).mean().to_numpy()  # inercia térmica
+        for variable, spec in asset["variables"].items():
             sens = LOAD_SENS.get(variable, 0.0)
-            span = abs(cfg["critical"] - cfg["base"])
-            sign = 1.0 if cfg["drift"] >= 0 else -1.0
+            span = abs(spec["critical"] - spec["base"])
+            sign = 1.0 if spec["drift"] >= 0 else -1.0
             series = thermal if "Temperatura" in variable else load
             load_effect[variable] = load_variability * sens * span * sign * series
-    inspection_step = max(1, int(round(inspection_h * 12))) if inspection_h > 0 else 0
+    inspection_step = max(1, int(round(inspection_h * SAMPLES_PER_HOUR))) if inspection_h > 0 else 0
     affected = MODOS_FALLA.get(failure_mode)
     weight = {v: (1.0 if affected is None or v in affected else 0.0) for v in asset["variables"]}
 
     def observe(deg, compensated=False):
         out = {}
-        for variable, cfg in asset["variables"].items():
+        for variable, spec in asset["variables"].items():
             effect = load_effect[variable] * (0.2 if compensated else 1.0)
-            values = np.array(cfg["base"] + deg * cfg["drift"] * weight[variable] + noise[variable] + effect, dtype=float)
+            values = np.array(spec["base"] + deg * spec["drift"] * weight[variable] + noise[variable] + effect, dtype=float)
             values[missing[variable]] = np.nan
-            if inspection_step and cfg.get("manual"):
+            if inspection_step and spec.get("manual"):
                 keep = np.zeros(points, dtype=bool)
                 keep[::inspection_step] = True      # la variable solo existe en cada inspección
                 values[~keep] = np.nan
@@ -345,19 +436,19 @@ def _simulate_core(
     def held(obs):
         """Para las variables de inspección, el gemelo conserva el último valor medido hasta la siguiente inspección."""
         out = dict(obs)
-        for variable, cfg in asset["variables"].items():
-            if inspection_step and cfg.get("manual"):
+        for variable, spec in asset["variables"].items():
+            if inspection_step and spec.get("manual"):
                 out[variable] = pd.Series(obs[variable]).ffill().to_numpy()
         return out
 
-    learn_samples = int(LEARN_H * 12)
+    learn_samples = int(LEARN_H * SAMPLES_PER_HOUR)
     intervention_index = None
     if policy == "Predictivo" and (scenario != "Operación normal" or evaluate_normal):
-        if detection == DETECCION_TSP:
-            # Versión del TSP: cruce del umbral por el estado simulado + 4 intervalos de espera.
+        if detection == DETECCION_ESTADO:
+            # Estado interno: cruce del umbral por el estado simulado + intervalos de persistencia.
             candidates = np.where(degradation >= intervention_threshold)[0]
             if len(candidates):
-                intervention_index = int(min(candidates[0] + 4, points - 1))
+                intervention_index = int(min(candidates[0] + PERSISTENCE_INTERVALS, points - 1))
         else:
             # Detección con lecturas: perfil normal aprendido y persistencia real de 4 lecturas seguidas.
             detect_obs = held(observe(degradation, compensated=compensate_load))
@@ -365,7 +456,7 @@ def _simulate_core(
             estimate = condition_index(detect_obs, asset, baseline)
             above = np.nan_to_num(estimate, nan=0.0) >= intervention_threshold
             above[:learn_samples] = False           # mientras aprende el perfil normal no propone intervenir
-            intervention_index = persistent_hit(above, 4)
+            intervention_index = persistent_hit(above, PERSISTENCE_INTERVALS)
         if intervention_index is not None:
             residual = degradation[intervention_index]
             degradation[intervention_index:] = np.maximum(
@@ -374,45 +465,47 @@ def _simulate_core(
             )
 
     observed_all = observe(degradation)
-    df = pd.DataFrame({"Hora simulada": hours, "Degradación": degradation * 100})
     statuses = np.full(points, "Normal", dtype=object)
     alerts = []
 
-    for variable, cfg in asset["variables"].items():
+    for variable, spec in asset["variables"].items():
         observed = observed_all[variable]
-        df[variable] = observed
-        if cfg["direction"] == "high":
-            warning_mask = observed >= cfg["warning"]
-            critical_mask = observed >= cfg["critical"]
+        if spec["direction"] == "high":
+            warning_mask = observed >= spec["warning"]
+            critical_mask = observed >= spec["critical"]
         else:
-            warning_mask = observed <= cfg["warning"]
-            critical_mask = observed <= cfg["critical"]
+            warning_mask = observed <= spec["warning"]
+            critical_mask = observed <= spec["critical"]
         statuses[warning_mask] = "Advertencia"
         statuses[critical_mask] = "Crítico"
-        warning_positions = np.where(warning_mask)[0]
-        if len(warning_positions):
-            idx = int(warning_positions[0])
-            alerts.append({
-                "Hora": round(float(hours[idx]), 2),
-                "Variable": variable,
-                "Lectura": round(float(observed[idx]), 3),
-                "Umbral": cfg["warning"],
-                "Nivel": "Crítico" if critical_mask[idx] else "Advertencia",
-            })
+        if full:
+            warning_positions = np.where(warning_mask)[0]
+            if len(warning_positions):
+                idx = int(warning_positions[0])
+                alerts.append({
+                    "Hora": round(float(hours[idx]), 2),
+                    "Variable": variable,
+                    "Lectura": round(float(observed[idx]), 3),
+                    "Umbral": spec["warning"],
+                    "Nivel": "Crítico" if critical_mask[idx] else "Advertencia",
+                })
 
     if intervention_index is not None:
         statuses[intervention_index:] = "Normal"
-        alerts.append({
-            "Hora": round(float(hours[intervention_index]), 2),
-            "Variable": "Mantenimiento",
-            "Lectura": 0.0,
-            "Umbral": 0.0,
-            "Nivel": "Intervención ejecutada",
-        })
+        if full:
+            alerts.append({
+                "Hora": round(float(hours[intervention_index]), 2),
+                "Variable": "Mantenimiento",
+                "Lectura": 0.0,
+                "Umbral": 0.0,
+                "Nivel": "Intervención ejecutada",
+            })
 
-    df["Estado"] = statuses
-    # Índice de condición mostrado: constantes del diagnóstico (método del TSP) o perfil aprendido y recalibrado.
-    if detection == DETECCION_TSP:
+    if not full:
+        return Telemetry(hours, degradation, observed_all, statuses, intervention_index, [], None, None)
+
+    # Índice de condición mostrado: constantes del diagnóstico o perfil aprendido y recalibrado.
+    if detection == DETECCION_ESTADO:
         index_pct = condition_index(observed_all, asset) * 100
         profile = np.full(points, "Constantes del diagnóstico", dtype=object)
     else:
@@ -424,106 +517,112 @@ def _simulate_core(
             recal_from = start + learn_samples
             index_pct[recal_from:] = (condition_index(shown, asset, learned_baseline(shown, asset, start, learn_samples)) * 100)[recal_from:]
             profile[recal_from:] = "Recalibrado tras la intervención"
-    df["Índice de condición estimado (%)"] = index_pct
-    df["Perfil normal"] = profile
-    alerts_df = pd.DataFrame(alerts).sort_values("Hora") if alerts else pd.DataFrame()
-    return df, alerts_df, intervention_index
+    return Telemetry(hours, degradation, observed_all, statuses, intervention_index, alerts, index_pct, profile)
 
 
-# Versión en caché para la interfaz; el núcleo sin caché se usa en los análisis con muchas repeticiones.
-simulate_telemetry = st.cache_data(show_spinner=False)(_simulate_core)
+def to_frames(t: Telemetry):
+    """Convierte una corrida completa en (telemetría, alertas, índice de intervención) para la interfaz."""
+    columns = {"Hora simulada": t.hours, "Degradación": t.degradation * 100}
+    columns.update(t.observed)
+    columns["Estado"] = t.statuses
+    columns["Índice de condición estimado (%)"] = t.condition_pct
+    columns["Perfil normal"] = t.profile
+    df = pd.DataFrame(columns)
+    alerts_df = pd.DataFrame(t.alerts).sort_values("Hora") if t.alerts else pd.DataFrame()
+    return df, alerts_df, t.intervention_index
 
 
-@st.cache_data(show_spinner=False)
-def detection_performance(asset_name, scenario, duration, noise_factor, missing_rate, threshold, detection,
-                          min_lead_h, n=150, load_variability=0.0, compensate_load=False, inspection_h=0.0,
-                          failure_mode=MODO_TODAS):
-    """Desempeño de la detección del gemelo con trayectorias distintas (pares reactiva/predictiva con la misma semilla).
-    Una falla se considera anticipada si la intervención propuesta ocurre al menos `min_lead_h` horas antes
-    de la condición crítica que se habría alcanzado sin intervenir."""
-    scn = scenario if scenario != "Operación normal" else "Desgaste progresivo"
-    leads, anticipated = [], []
-    for k in range(1, n + 1):
-        sd = 5000 + k
-        # La condición crítica física se fija con una corrida de referencia sin carga ni limitaciones de captura:
-        # la falla ocurre aunque nadie la mida, y la carga sola no es una falla.
-        re_df, _, _ = _simulate_core(asset_name, scn, "Reactivo", duration, sd, noise_factor, missing_rate, threshold, detection,
-                                     failure_mode=failure_mode)
-        critical = np.flatnonzero((re_df["Estado"] == "Crítico").to_numpy())
-        if len(critical) == 0:
-            continue  # sin falla en el horizonte: no hay nada que anticipar
-        t_critical = float(re_df["Hora simulada"].iloc[critical[0]])
-        pr_df, _, idx = _simulate_core(asset_name, scn, "Predictivo", duration, sd, noise_factor, missing_rate, threshold, detection,
-                                       load_variability=load_variability, compensate_load=compensate_load, inspection_h=inspection_h,
-                                     failure_mode=failure_mode)
-        if idx is None:
-            leads.append(np.nan)
-            anticipated.append(False)
-            continue
-        lead = t_critical - float(pr_df["Hora simulada"].iloc[idx])
-        leads.append(lead)
-        anticipated.append(lead >= min_lead_h)
-    false_alarms = 0
-    for k in range(1, n + 1):
-        _, _, idx = _simulate_core(asset_name, "Operación normal", "Predictivo", duration, 9000 + k, noise_factor,
-                                   missing_rate, threshold, detection, evaluate_normal=True,
-                                   load_variability=load_variability, compensate_load=compensate_load, inspection_h=inspection_h,
-                                     failure_mode=failure_mode)
-        false_alarms += idx is not None
-    leads_arr = np.array(leads, dtype=float)
-    valid = leads_arr[~np.isnan(leads_arr)]
-    return {
-        "fallas": len(anticipated),
-        "p_anticipada": float(np.mean(anticipated)) if anticipated else float("nan"),
-        "p_detectada": float(np.mean(~np.isnan(leads_arr))) if len(leads_arr) else float("nan"),
-        "aviso_mediano_h": float(np.median(valid)) if len(valid) else float("nan"),
-        "aviso_p10_h": float(np.percentile(valid, 10)) if len(valid) else float("nan"),
-        "falsas_alarmas": false_alarms / n,
-    }
-
-
-@st.cache_data(show_spinner=False)
-def threshold_tradeoff(asset_name, scenario, duration, noise_factor, missing_rate, min_lead_h, n=60,
-                       load_variability=0.0, compensate_load=False, inspection_h=0.0, failure_mode=MODO_TODAS):
-    """Compromiso del umbral de intervención con el método por lecturas: anticipación frente a falsas alarmas."""
-    rows = []
-    for pct in range(45, 86, 5):
-        r = detection_performance(asset_name, scenario, duration, noise_factor, missing_rate, pct / 100,
-                                  DETECCION_LECTURAS, min_lead_h, n, load_variability, compensate_load, inspection_h, failure_mode)
-        rows.append({"Umbral (%)": pct, "Fallas anticipadas (%)": r["p_anticipada"] * 100,
-                     "Falsas alarmas (%)": r["falsas_alarmas"] * 100, "Aviso mediano (h)": r["aviso_mediano_h"]})
-    return pd.DataFrame(rows)
+def simulate_frames(sim: SimConfig, policy: str):
+    return to_frames(run_simulation(sim, policy, full=True))
 
 
 def data_quality(df, asset_name, exclude_manual=False):
     """Completitud de las lecturas de sensores; las variables de inspección manual se excluyen si se piden así."""
-    variables = [v for v, cfg in ASSETS[asset_name]["variables"].items() if not (exclude_manual and cfg.get("manual"))]
+    variables = [v for v, spec in ASSETS[asset_name]["variables"].items() if not (exclude_manual and spec.get("manual"))]
     expected = len(df) * len(variables)
     observed = int(df[variables].notna().sum().sum())
     return observed / expected * 100 if expected else 0.0
 
 
-@st.cache_data(show_spinner=False)
-def experiment_matrix(asset_name, duration, seed, noise_factor, missing_rate, intervention_threshold, detection,
-                      load_variability=0.0, compensate_load=False, inspection_h=0.0, failure_mode=MODO_TODAS):
+# ===========================================================================
+# DETECTION
+# ===========================================================================
+
+DEFAULT_TRAJECTORIES = 150
+
+
+def failing_scenario(sim: SimConfig) -> str:
+    return sim.scenario if sim.scenario != "Operación normal" else "Desgaste progresivo"
+
+
+def reference_config(sim: SimConfig) -> SimConfig:
+    """Configuración canónica de la referencia reactiva: solo conserva lo que la afecta."""
+    return SimConfig(
+        asset_name=sim.asset_name, scenario=failing_scenario(sim), duration=sim.duration, seed=0,
+        noise_factor=sim.noise_factor, missing_rate=sim.missing_rate, failure_mode=sim.failure_mode,
+    )
+
+
+def detection_config(sim: SimConfig) -> SimConfig:
+    """Configuración canónica de la corrida predictiva con trayectoria de falla (la semilla se fija por trayectoria)."""
+    return replace(sim, scenario=failing_scenario(sim), seed=0, evaluate_normal=False)
+
+
+def critical_hours(ref: SimConfig, n: int = DEFAULT_TRAJECTORIES) -> np.ndarray:
+    """Hora de condición crítica sin intervenir; NaN si la trayectoria no llega a ella en el horizonte."""
+    out = np.full(n, np.nan)
+    for k in range(1, n + 1):
+        t = run_simulation(replace(ref, seed=SEED_FAILING + k), "Reactivo", full=False)
+        critical = np.flatnonzero(t.statuses == "Crítico")
+        if len(critical):
+            out[k - 1] = t.hours[critical[0]]
+    return out
+
+
+def intervention_hours(sim: SimConfig, critical: np.ndarray) -> np.ndarray:
+    """Hora de intervención propuesta en las trayectorias que llegan a condición crítica (NaN si no hay detección)."""
+    out = np.full(len(critical), np.nan)
+    for k in np.flatnonzero(~np.isnan(critical)):
+        t = run_simulation(replace(sim, seed=SEED_FAILING + int(k) + 1), "Predictivo", full=False)
+        if t.intervention_index is not None:
+            out[k] = t.hours[t.intervention_index]
+    return out
+
+
+def false_alarm_rate(sim: SimConfig, n: int = DEFAULT_TRAJECTORIES) -> float:
+    """Fracción de corridas de operación normal en las que el gemelo propone intervenir."""
+    normal = replace(sim, scenario="Operación normal", evaluate_normal=True)
+    hits = 0
+    for k in range(1, n + 1):
+        t = run_simulation(replace(normal, seed=SEED_NORMAL + k), "Predictivo", full=False)
+        hits += t.intervention_index is not None
+    return hits / n
+
+
+def summarize_detection(critical: np.ndarray, interventions: np.ndarray, false_alarms: float, min_lead_h: float) -> dict:
+    has_failure = ~np.isnan(critical)
+    leads = critical[has_failure] - interventions[has_failure]   # NaN = falla sin detección
+    valid = leads[~np.isnan(leads)]
+    return {
+        "fallas": int(has_failure.sum()),
+        "p_anticipada": float(np.mean(leads >= min_lead_h)) if len(leads) else float("nan"),
+        "p_detectada": float(np.mean(~np.isnan(leads))) if len(leads) else float("nan"),
+        "aviso_mediano_h": float(np.median(valid)) if len(valid) else float("nan"),
+        "aviso_p10_h": float(np.percentile(valid, 10)) if len(valid) else float("nan"),
+        "falsas_alarmas": false_alarms,
+    }
+
+
+# ===========================================================================
+# EXPERIMENTS
+# ===========================================================================
+
+def experiment_matrix(sim: SimConfig, simulate: Callable = simulate_frames) -> pd.DataFrame:
     rows = []
     for scenario_name in SCENARIOS:
-        for policy_name in ["Reactivo", "Predictivo"]:
-            trial, trial_alerts, trial_intervention = simulate_telemetry(
-                asset_name,
-                scenario_name,
-                policy_name,
-                duration,
-                seed + len(rows) * 17,
-                noise_factor,
-                missing_rate,
-                intervention_threshold,
-                detection,
-                load_variability=load_variability,
-                compensate_load=compensate_load,
-                inspection_h=inspection_h,
-                failure_mode=failure_mode,
-            )
+        for policy_name in POLICIES:
+            run_cfg = replace(sim, scenario=scenario_name, seed=sim.seed + len(rows) * SEED_STEP_EXPERIMENT)
+            trial, trial_alerts, trial_intervention = simulate(run_cfg, policy_name)
             critical = trial.index[trial["Estado"] == "Crítico"].tolist()
             predictive_alerts = (
                 trial_alerts[trial_alerts["Nivel"] != "Intervención ejecutada"]
@@ -535,7 +634,7 @@ def experiment_matrix(asset_name, duration, seed, noise_factor, missing_rate, in
             rows.append({
                 "Escenario": scenario_name,
                 "Política": policy_name,
-                "Calidad de datos (%)": round(data_quality(trial, asset_name, inspection_h > 0), 2),
+                "Calidad de datos (%)": round(data_quality(trial, sim.asset_name, sim.inspection_h > 0), 2),
                 "Primera alerta (h)": round(first_warning, 2) if not np.isnan(first_warning) else np.nan,
                 "Condición crítica (h)": round(critical_hour, 2) if not np.isnan(critical_hour) else np.nan,
                 "Intervención (h)": round(float(trial.loc[trial_intervention, "Hora simulada"]), 2)
@@ -545,8 +644,13 @@ def experiment_matrix(asset_name, duration, seed, noise_factor, missing_rate, in
     return pd.DataFrame(rows)
 
 
-@st.cache_data(show_spinner=False)
-def monte_carlo(asset_name, mtbf_gain, mttr_reduction, simulations, seed):
+# ===========================================================================
+# MONTE_CARLO
+# ===========================================================================
+
+def monte_carlo_sample(asset_name, mtbf_gain, mttr_reduction, simulations, seed):
+    if not 0 <= mttr_reduction < 100:
+        raise ValueError("mttr_reduction debe estar entre 0 y 100")
     asset = ASSETS[asset_name]
     _, base_mtbf, base_mttr, _ = base_metrics(asset)
     rng = np.random.default_rng(seed + 99)
@@ -571,12 +675,11 @@ def monte_carlo(asset_name, mtbf_gain, mttr_reduction, simulations, seed):
     })
 
 
-@st.cache_data(show_spinner=False)
-def seed_robustness(asset_name, mtbf_gain, mttr_reduction, simulations, n_seeds=100):
-    """Repite el Monte Carlo con otras semillas para ver cuánto cambia el promedio."""
+def seed_means(asset_name, mtbf_gain, mttr_reduction, simulations, n_seeds=100) -> pd.DataFrame:
+    """Repite el Monte Carlo con otras semillas y conserva solo el promedio predictivo de cada una."""
     rows = []
     for s in range(1, n_seeds + 1):
-        sample = monte_carlo(asset_name, mtbf_gain, mttr_reduction, simulations, s)
+        sample = monte_carlo_sample(asset_name, mtbf_gain, mttr_reduction, simulations, s)
         pred = sample[sample["Política"] == "Predictiva"]
         rows.append({
             "Semilla": s,
@@ -587,9 +690,10 @@ def seed_robustness(asset_name, mtbf_gain, mttr_reduction, simulations, n_seeds=
     return pd.DataFrame(rows)
 
 
-# ---------------------------------------------------------------------------
-# Estado de las lecturas
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# READINGS
+# ===========================================================================
+
 def reading_level(value, cfg):
     if value is None or np.isnan(value):
         return "Sin dato"
@@ -620,9 +724,53 @@ def worst_level(levels):
     return "Sin dato"
 
 
-# ---------------------------------------------------------------------------
-# Componentes visuales
-# ---------------------------------------------------------------------------
+
+def verdict(ok):
+    return "Cumple" if ok else "No cumple"
+
+
+# ===========================================================================
+# CARDS
+# ===========================================================================
+
+def status_card(asset_name, status, health, hour):
+    css_status = {"Normal": "normal", "Advertencia": "warning", "Crítico": "critical"}[status]
+    label = {"Normal": "OPERACIÓN NORMAL", "Advertencia": "REQUIERE ATENCIÓN", "Crítico": "RIESGO DE FALLA"}[status]
+    asset = ASSETS[asset_name]
+    st.markdown(
+        f'<div class="status-card status-{css_status}">'
+        f'<div class="machine-name">{asset_name} · {asset["code"]}</div>'
+        f'<div class="machine-meta">Área de {asset["area"]} · Gemelo simulado · hora {hour:.2f}</div>'
+        f'<span class="status-pill pill-{css_status}">{label}</span>'
+        f'<div class="small-muted" style="margin-top:12px">Índice de salud simulado: '
+        f'<b style="color:#f8fafc">{health:.1f}%</b></div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def reading_card(variable, value, cfg, age_steps, inspected=False):
+    level = reading_level(value, cfg)
+    color = LEVEL_COLOR[level]
+    note = ""
+    if inspected and cfg.get("manual"):
+        when = f"hace {age_steps * 5 / 60:.1f} h" if age_steps else "en este instante"
+        note = f'<div class="reading-meta">Última inspección TPM {when}</div>'
+    elif age_steps:
+        note = f'<div class="reading-meta">Dato perdido: última lectura válida hace {age_steps * 5} min</div>'
+    st.markdown(
+        f'<div class="reading" style="border-left:4px solid {color}">'
+        f'<div class="reading-label">{variable}</div>'
+        f'<div class="reading-value">{value_text(variable, value)}</div>'
+        f'<div class="reading-meta"><b style="color:{color}">{level}</b> · advertencia {cfg["warning"]} · crítico {cfg["critical"]}</div>'
+        f'{note}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ===========================================================================
+# CHARTS
+# ===========================================================================
+
 def telemetry_figure(df, asset_name, hour=None, inspected=False):
     variables = list(ASSETS[asset_name]["variables"].keys())
     colors = ["#22d3ee", "#fbbf24", "#a78bfa", "#34d399"]
@@ -642,8 +790,8 @@ def telemetry_figure(df, asset_name, hour=None, inspected=False):
             fig.add_vline(x=hour, line_color="#cbd5e1", line_width=1, opacity=.55, row=row, col=col)
     fig.update_layout(height=560, margin=dict(l=20, r=20, t=55, b=20), paper_bgcolor="#0b1a2a",
                       plot_bgcolor="#081522", font_color="#b8c7d9", hovermode="x unified")
-    fig.update_xaxes(title_text="Horas", gridcolor="rgba(255,255,255,.06)")
-    fig.update_yaxes(gridcolor="rgba(255,255,255,.06)")
+    fig.update_xaxes(title_text="Horas", gridcolor=GRID_COLOR)
+    fig.update_yaxes(gridcolor=GRID_COLOR)
     return fig
 
 
@@ -681,44 +829,34 @@ def timeline_figure(df_re, df_pr, alerts_re, alerts_pr, idx_pr, hour):
                       font_color="#b8c7d9", xaxis_title="Hora simulada", yaxis=dict(autorange="reversed"))
     return fig
 
+def sensitivity_figure(asset_name, mtbf_gain, mttr_reduction):
+    _, M, R, _ = base_metrics(ASSETS[asset_name])
+    gains = np.arange(0, 61, 5)
+    reductions = np.arange(0, 61, 5)
+    z = np.array([[availability_pct(M * (1 + g / 100), R * (1 - r / 100)) for g in gains] for r in reductions])
+    fig = go.Figure(go.Heatmap(z=z, x=gains, y=reductions, colorscale="Viridis",
+                               colorbar=dict(title="Disp. (%)"),
+                               hovertemplate="MTBF +%{x} %<br>MTTR −%{y} %<br>Disponibilidad %{z:.2f} %<extra></extra>"))
+    fig.add_trace(go.Contour(z=z, x=gains, y=reductions, showscale=False, hoverinfo="skip",
+                             contours=dict(coloring="none", start=META_DISPONIBILIDAD, end=META_DISPONIBILIDAD,
+                                           size=1, showlabels=True),
+                             line=dict(color="#fb7185", width=3)))
+    fig.add_trace(go.Scatter(x=[mtbf_gain], y=[mttr_reduction], mode="markers", name="Supuesto actual",
+                             marker=dict(size=14, color="white", line=dict(color="black", width=2))))
+    fig.update_layout(height=440, **THEME,
+                      margin=dict(l=20, r=20, t=30, b=20),
+                      xaxis_title="Incremento del MTBF (%)", yaxis_title="Reducción del MTTR (%)",
+                      legend=dict(orientation="h", y=1.1))
+    return fig
 
-def status_card(asset_name, status, health, hour):
-    css_status = {"Normal": "normal", "Advertencia": "warning", "Crítico": "critical"}[status]
-    label = {"Normal": "OPERACIÓN NORMAL", "Advertencia": "REQUIERE ATENCIÓN", "Crítico": "RIESGO DE FALLA"}[status]
-    asset = ASSETS[asset_name]
-    st.markdown(
-        f'<div class="status-card status-{css_status}">'
-        f'<div class="machine-name">{asset_name} · {asset["code"]}</div>'
-        f'<div class="machine-meta">Área de {asset["area"]} · Gemelo simulado · hora {hour:.2f}</div>'
-        f'<span class="status-pill pill-{css_status}">{label}</span>'
-        f'<div class="small-muted" style="margin-top:12px">Índice de salud simulado: '
-        f'<b style="color:#f8fafc">{health:.1f}%</b></div></div>',
-        unsafe_allow_html=True,
-    )
 
-
-def reading_card(variable, value, cfg, age_steps, inspected=False):
-    level = reading_level(value, cfg)
-    color = LEVEL_COLOR[level]
-    note = ""
-    if inspected and cfg.get("manual"):
-        when = f"hace {age_steps * 5 / 60:.1f} h" if age_steps else "en este instante"
-        note = f'<div class="reading-meta">Última inspección TPM {when}</div>'
-    elif age_steps:
-        note = f'<div class="reading-meta">Dato perdido: última lectura válida hace {age_steps * 5} min</div>'
-    st.markdown(
-        f'<div class="reading" style="border-left:4px solid {color}">'
-        f'<div class="reading-label">{variable}</div>'
-        f'<div class="reading-value">{value_text(variable, value)}</div>'
-        f'<div class="reading-meta"><b style="color:{color}">{level}</b> · advertencia {cfg["warning"]} · crítico {cfg["critical"]}</div>'
-        f'{note}</div>',
-        unsafe_allow_html=True,
-    )
-
+# ===========================================================================
+# REPLICA3D
+# ===========================================================================
 
 _LIGHT = dict(ambient=0.62, diffuse=0.85, specular=0.18, roughness=0.6)
 
-# Colores tomados de las fotos de los equipos
+# Paleta de los equipos
 RED, HAZ_Y, HAZ_K = "#b3262c", "#e9b800", "#1b1d21"
 STEEL, DARK, RUST, SLAT = "#9aa5b1", "#3a414b", "#6d4c3d", "#7b5a47"
 CREAM, PANEL, GREEN_FRAME = "#e6e1d1", "#dfe5e8", "#3f8f5a"
@@ -778,31 +916,6 @@ def hazard_boxes(x0, y0, z0, dx, dy, dz, n=8):
     black = [(x0 + s * step, y0, z0, step, dy, dz) for s in range(1, n, 2)]
     return yellow, black
 
-
-# ---------------------------------------------------------------------------
-# Equipos reales (rótulos visibles en las fotos y fichas consultadas)
-# Las dimensiones del modelo 3D son ESTIMADAS a partir de las fotos; reemplazar con la medición en planta.
-# ---------------------------------------------------------------------------
-EQUIPMENT_SPECS = {
-    "CNC plasma": [
-        ("Tipo de máquina", "Pórtico CNC de corte por plasma y oxicorte, con rieles laterales y mesa de parrilla", "Fotos"),
-        ("Fabricante (rótulo en la viga)", "«… Buluoer Intelligence»; modelo no identificado", "Fotos"),
-        ("Controlador", "Fangling F2300BT: 2 ejes, salida de pulsos y dirección a los drivers, sin realimentación de posición; control de altura de antorcha por tensión de arco; USB y RS-232; hasta 15 m/min", "Rótulo + manual de la serie F2000"),
-        ("Fuente de plasma", "LGK-200 IGBT: inversor trifásico de 380 V, clase 200 A; los catálogos difieren en corriente nominal y ciclo de trabajo", "Rótulo + catálogos de la serie LGK"),
-        ("Antorchas", "Dos antorchas en el carro (plasma y oxicorte); selector Plasma/Llama en el panel", "Fotos"),
-        ("Área de corte y dimensiones", "Estimadas: unos 3 m de luz de pórtico y 6 m de recorrido", "Estimado: confirmar en planta"),
-        ("Fallas del historial", "8 fallas: 5 en el eje X y 3 en el eje Y", "Registro de fallas"),
-        ("Datos del controlador (modelos «T»)", "Contadores de perforaciones, piezas, distancia y tiempo de corte, y tiempo de funcionamiento", "Manual de la serie F2000: verificar en la unidad"),
-    ],
-    "Torno": [
-        ("Tipo de máquina", "Torno paralelo horizontal manual de bancada larga, con plato de garras, portaherramientas de 4 posiciones y contrapunto", "Fotos"),
-        ("Fabricante (rótulo)", "TOPTECH; modelo no legible en las fotos", "Fotos"),
-        ("Placa de características", "Pendiente: registrar modelo, potencia, tensión y número de serie", "Por levantar en planta"),
-        ("Velocidad del husillo", "Se selecciona con palancas; el panel indica límites de «≤ 500 r/min» y «≤ 600 r/min» junto a pictogramas de plato", "Lectura de foto: verificar"),
-        ("Fallas del historial", "6 fallas: 2 en cabezal y caja de velocidades, 3 en carro, torreta y bancada, 1 en el contrapunto", "Registro de fallas"),
-        ("Dimensiones", "Estimadas: unos 3.6 m de largo, 1.4 m de fondo y 1.6 m de alto", "Estimado: confirmar en planta"),
-    ],
-}
 
 
 def tint(box, status_color, name):
@@ -902,7 +1015,7 @@ def _lathe_scene(status_color):
                              (1250, 410, 1415, 110, 80, 90), (1250, 410, 1035, 110, 80, 90)], "#5a6068", "Garras del plato"))
     parts.append(cyl_mesh("x", 1360, 150, 80, 450, 1265, "#c6ccd3", "Pieza de trabajo (referencial)"))
     # Respaldo, tornillo patrón y barra de avance
-    parts.append(box_mesh(1100, 760, 950, 2400, 60, 420, CREAM, "Respaldo de bancada (estimado)"))
+    parts.append(box_mesh(1100, 760, 950, 2400, 60, 420, CREAM, "Respaldo de bancada"))
     parts.append(cyl_mesh("x", 1100, 2400, 22, 120, 810, "#aab4bf", "Tornillo patrón"))
     parts.append(cyl_mesh("x", 1100, 2400, 16, 120, 880, "#aab4bf", "Barra de avance"))
     # Carro longitudinal, delantal con volantes, carro transversal y portaherramientas de 4 posiciones
@@ -938,7 +1051,7 @@ def _lathe_scene(status_color):
 
 
 def replica_figure(asset_name, readings):
-    """Modelo 3D esquemático construido a partir de fotos del equipo (dimensiones estimadas).
+    """Modelo 3D esquemático del equipo con sus puntos de medición.
     Los colores reales se conservan; el estado de las lecturas se muestra en las capas
     translúcidas sobre las piezas monitoreadas, en los marcadores de sensores y en el indicador superior."""
     asset = ASSETS[asset_name]
@@ -970,185 +1083,188 @@ def replica_figure(asset_name, readings):
     )
     fig = go.Figure(parts + [sensors, indicator])
     fig.update_layout(
-        height=600, margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor="#0b1a2a", font_color="#b8c7d9",
-        scene=dict(aspectmode="data", bgcolor="#081522", camera=dict(eye=eye),
+        height=600, margin=dict(l=0, r=0, t=10, b=0), paper_bgcolor=PAPER_BG, font_color=FONT_COLOR,
+        scene=dict(aspectmode="data", bgcolor=PLOT_BG, camera=dict(eye=eye),
                    xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)),
     )
     return fig, levels
 
 
-def sensitivity_figure(asset_name, mtbf_gain, mttr_reduction):
-    _, M, R, _ = base_metrics(ASSETS[asset_name])
-    gains = np.arange(0, 61, 5)
-    reductions = np.arange(0, 61, 5)
-    z = np.array([[availability_pct(M * (1 + g / 100), R * (1 - r / 100)) for g in gains] for r in reductions])
-    fig = go.Figure(go.Heatmap(z=z, x=gains, y=reductions, colorscale="Viridis",
-                               colorbar=dict(title="Disp. (%)"),
-                               hovertemplate="MTBF +%{x} %<br>MTTR −%{y} %<br>Disponibilidad %{z:.2f} %<extra></extra>"))
-    fig.add_trace(go.Contour(z=z, x=gains, y=reductions, showscale=False, hoverinfo="skip",
-                             contours=dict(coloring="none", start=META_DISPONIBILIDAD, end=META_DISPONIBILIDAD,
-                                           size=1, showlabels=True),
-                             line=dict(color="#fb7185", width=3)))
-    fig.add_trace(go.Scatter(x=[mtbf_gain], y=[mttr_reduction], mode="markers", name="Supuesto actual",
-                             marker=dict(size=14, color="white", line=dict(color="black", width=2))))
-    fig.update_layout(height=440, paper_bgcolor="#0b1a2a", plot_bgcolor="#081522", font_color="#b8c7d9",
-                      margin=dict(l=20, r=20, t=30, b=20),
-                      xaxis_title="Incremento del MTBF (%)", yaxis_title="Reducción del MTTR (%)",
-                      legend=dict(orientation="h", y=1.1))
-    return fig
+# ===========================================================================
+# CACHING
+# ===========================================================================
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def simulate_telemetry(sim: SimConfig, policy: str):
+    return simulate_frames(sim, policy)
 
 
-# ---------------------------------------------------------------------------
-# Barra lateral
-# ---------------------------------------------------------------------------
-for _key, _value in DEFAULTS.items():
-    st.session_state.setdefault(_key, _value)
+@st.cache_data(show_spinner=False, max_entries=16)
+def experiment_results(sim: SimConfig) -> pd.DataFrame:
+    return experiment_matrix(sim, simulate=simulate_telemetry)
 
 
-def reset_defaults():
+@st.cache_data(show_spinner=False, max_entries=32)
+def monte_carlo(asset_name, mtbf_gain, mttr_reduction, simulations, seed):
+    return monte_carlo_sample(asset_name, mtbf_gain, mttr_reduction, simulations, seed)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def seed_robustness(asset_name, mtbf_gain, mttr_reduction, simulations, n_seeds=100):
+    return seed_means(asset_name, mtbf_gain, mttr_reduction, simulations, n_seeds)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _critical_hours(ref: SimConfig, n: int) -> np.ndarray:
+    return critical_hours(ref, n)
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _intervention_hours(sim: SimConfig, critical: np.ndarray) -> np.ndarray:
+    return intervention_hours(sim, critical)
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _false_alarm_rate(sim: SimConfig, n: int) -> float:
+    return false_alarm_rate(sim, n)
+
+
+def detection_performance(sim: SimConfig, min_lead_h: float, n: int = DEFAULT_TRAJECTORIES) -> dict:
+    """Desempeño de la detección. Cambiar `min_lead_h` no vuelve a simular; cambiar el umbral reutiliza la referencia."""
+    critical = _critical_hours(reference_config(sim), n)
+    interventions = _intervention_hours(detection_config(sim), critical)
+    false_alarms = _false_alarm_rate(replace(sim, scenario="Operación normal", seed=0, evaluate_normal=True), n)
+    return summarize_detection(critical, interventions, false_alarms, min_lead_h)
+
+
+def threshold_tradeoff(sim: SimConfig, min_lead_h: float, n: int = 60) -> pd.DataFrame:
+    """Compromiso del umbral de intervención con el método por lecturas: anticipación frente a falsas alarmas."""
+    rows = []
+    for pct in range(45, 86, 5):
+        trial = replace(sim, intervention_threshold=pct / 100, detection=DETECCION_LECTURAS)
+        r = detection_performance(trial, min_lead_h, n)
+        rows.append({"Umbral (%)": pct, "Fallas anticipadas (%)": r["p_anticipada"] * 100,
+                     "Falsas alarmas (%)": r["falsas_alarmas"] * 100, "Aviso mediano (h)": r["aviso_mediano_h"]})
+    return pd.DataFrame(rows)
+
+
+# ===========================================================================
+# SIDEBAR
+# ===========================================================================
+
+@dataclass(frozen=True)
+class Controls:
+    asset_name: str
+    scenario: str
+    policy: str
+    duration: int
+    seed: int
+    mtbf_gain: float
+    mttr_reduction: float
+    simulations: int
+    noise_factor: float
+    missing_rate_pct: int
+    intervention_pct: int
+    position_capture: str
+    inspection_h: int
+    load_pct: int
+    failure_mode: str
+    compensate_load: bool
+    detection: str
+
+    @property
+    def missing_rate(self) -> float:
+        return self.missing_rate_pct / 100
+
+    @property
+    def intervention_threshold(self) -> float:
+        return self.intervention_pct / 100
+
+    @property
+    def inspection_eff(self) -> float:
+        """Intervalo efectivo de inspección (0 = captura continua)."""
+        return float(self.inspection_h) if self.position_capture == CAPTURA_INSPECCION else 0.0
+
+
+def init_state() -> None:
+    for key, value in DEFAULTS.items():
+        st.session_state.setdefault(key, value)
+
+
+def reset_defaults() -> None:
     for key, value in DEFAULTS.items():
         st.session_state[key] = value
 
 
-with st.sidebar:
-    st.markdown("## ⚙️ Configuración")
-    asset_name = st.selectbox("Activo digital", list(ASSETS.keys()), key="asset_name")
-    scenario = st.selectbox("Escenario", SCENARIOS, key="scenario")
-    policy = st.radio("Política de mantenimiento", ["Reactivo", "Predictivo"], horizontal=True, key="policy")
-    duration = st.slider("Duración simulada (horas)", 8, 72, step=4, key="duration")
-    seed = st.number_input("Semilla del experimento", min_value=1, max_value=9999, key="seed")
-    st.divider()
-    st.markdown("#### Supuestos TO-BE")
-    mtbf_gain = st.slider("Incremento proyectado del MTBF (%)", 5.0, 60.0, step=0.1, format="%.1f", key="mtbf_gain")
-    mttr_reduction = st.slider("Reducción proyectada del MTTR (%)", 5.0, 60.0, step=0.1, format="%.1f", key="mttr_reduction")
-    simulations = st.select_slider("Corridas Monte Carlo", options=[100, 250, 500, 1000, 5000, 10000], key="simulations")
-    st.divider()
-    st.markdown("#### Pruebas de robustez")
-    noise_factor = st.slider("Ruido del sensor", 0.5, 3.0, step=0.1, key="noise_factor")
-    missing_rate_pct = st.slider("Pérdida simulada de datos (%)", 0, 20, step=1, key="missing_rate_pct")
-    intervention_pct = st.slider("Umbral de intervención (% de degradación)", 45, 85, step=1, key="intervention_pct")
-    position_capture = st.selectbox(
-        "Captura del error de posición (CNC)", [CAPTURA_CONTINUA, CAPTURA_INSPECCION], key="position_capture",
-        help="El controlador F2300BT no exporta el error de posición: en planta se mide en la inspección del mantenimiento autónomo. "
-             "«Continua» es la simplificación de la versión del TSP.")
-    inspection_h = st.slider("Intervalo entre inspecciones TPM (h)", 1, 24, step=1, key="inspection_h",
-                             disabled=position_capture == CAPTURA_CONTINUA)
-    load_pct = st.slider("Variación de la carga operativa (%)", 0, 100, step=5, key="load_pct",
-                         help="Simula cambios de carga que mueven la vibración, la corriente y la temperatura sin que haya degradación. "
-                              "Con 100 %, a plena carga la corriente llega al límite crítico.")
-    failure_mode = st.selectbox("Modo de falla simulado", list(MODOS_FALLA.keys()), key="failure_mode",
-                                help="Qué variables muestran la degradación. En el CNC, el modo «solo error de posición» representa las holguras "
-                                     "y descalibraciones del historial, que solo se ven en la inspección. Con el método de detección del TSP "
-                                     "el umbral se evalúa sobre el estado interno y este modo no cambia la intervención.")
-    compensate_load = st.checkbox("Compensar el régimen de carga (perfil normal por régimen)", key="compensate_load",
-                                  help="Solo aplica al método «estimado desde lecturas»: el gemelo descuenta la carga conocida antes de estimar la condición.")
-    detection = st.selectbox(
-        "Método de detección", [DETECCION_TSP, DETECCION_LECTURAS], key="detection",
-        help="'Versión del TSP': el umbral se evalúa sobre el estado interno del simulador. "
-             "'Estimado desde lecturas': el gemelo estima la condición solo con las lecturas de los sensores "
-             "y exige 4 lecturas seguidas por encima del umbral.",
-    )
-    st.button("↺ Restaurar valores del TSP", on_click=reset_defaults, width="stretch")
-    st.caption("Los valores por defecto reproducen la configuración principal del TSP. "
-               "Los supuestos pueden modificarse durante la sustentación para el análisis de sensibilidad.")
-    with st.expander("¿Qué afecta a qué?"):
-        st.markdown(
-            "**Cambian la franja de estado, la telemetría, las alertas y la réplica:** activo, escenario, duración, semilla, "
-            "ruido, pérdida de datos, umbral de intervención, método de detección, captura del error de posición, variación de carga y compensación de régimen.\n\n"
-            "**Cambian solo los indicadores (Monte Carlo y sensibilidad):** incremento del MTBF, reducción del MTTR y corridas.\n\n"
-            "**Los vincula** el panel «Sustento del supuesto» de la pestaña Sensibilidad: calcula cuántas fallas debe evitar "
-            "el gemelo para sostener el incremento del MTBF y lo compara con lo que logra la detección simulada."
+def render_sidebar() -> Controls:
+    init_state()
+    with st.sidebar:
+        st.markdown("## ⚙️ Configuración")
+        asset_name = st.selectbox("Activo digital", list(ASSETS.keys()), key="asset_name")
+        scenario = st.selectbox("Escenario", SCENARIOS, key="scenario")
+        policy = st.radio("Política de mantenimiento", ["Reactivo", "Predictivo"], horizontal=True, key="policy")
+        duration = st.slider("Duración simulada (horas)", 8, 72, step=4, key="duration")
+        seed = st.number_input("Semilla del experimento", min_value=1, max_value=9999, key="seed")
+        st.divider()
+        st.markdown("#### Supuestos TO-BE")
+        mtbf_gain = st.slider("Incremento proyectado del MTBF (%)", 5.0, 60.0, step=0.1, format="%.1f", key="mtbf_gain")
+        mttr_reduction = st.slider("Reducción proyectada del MTTR (%)", 5.0, 60.0, step=0.1, format="%.1f", key="mttr_reduction")
+        simulations = st.select_slider("Corridas Monte Carlo", options=[100, 250, 500, 1000, 5000, 10000], key="simulations")
+        st.divider()
+        st.markdown("#### Pruebas de robustez")
+        noise_factor = st.slider("Ruido del sensor", 0.5, 3.0, step=0.1, key="noise_factor")
+        missing_rate_pct = st.slider("Pérdida simulada de datos (%)", 0, 20, step=1, key="missing_rate_pct")
+        intervention_pct = st.slider("Umbral de intervención (% de degradación)", 45, 85, step=1, key="intervention_pct")
+        position_capture = st.selectbox(
+            "Captura del error de posición (CNC)", [CAPTURA_CONTINUA, CAPTURA_INSPECCION], key="position_capture",
+            help="El controlador F2300BT no exporta el error de posición: en planta se mide en la inspección del mantenimiento autónomo. "
+                 "«Continua» es una simplificación del modelo.")
+        inspection_h = st.slider("Intervalo entre inspecciones TPM (h)", 1, 24, step=1, key="inspection_h",
+                                 disabled=position_capture == CAPTURA_CONTINUA)
+        load_pct = st.slider("Variación de la carga operativa (%)", 0, 100, step=5, key="load_pct",
+                             help="Simula cambios de carga que mueven la vibración, la corriente y la temperatura sin que haya degradación. "
+                                  "Con 100 %, a plena carga la corriente llega al límite crítico.")
+        failure_mode = st.selectbox("Modo de falla simulado", list(MODOS_FALLA.keys()), key="failure_mode",
+                                    help="Qué variables muestran la degradación. En el CNC, el modo «solo error de posición» representa las holguras "
+                                         "y descalibraciones del historial, que solo se ven en la inspección. Con el método de estado interno "
+                                         "el umbral se evalúa sobre el estado interno y este modo no cambia la intervención.")
+        compensate_load = st.checkbox("Compensar el régimen de carga (perfil normal por régimen)", key="compensate_load",
+                                      help="Solo aplica al método «estimado desde lecturas»: el gemelo descuenta la carga conocida antes de estimar la condición.")
+        detection = st.selectbox(
+            "Método de detección", [DETECCION_ESTADO, DETECCION_LECTURAS], key="detection",
+            help="'Estado interno': el umbral se evalúa sobre el estado interno del simulador. "
+                 "'Estimado desde lecturas': el gemelo estima la condición solo con las lecturas de los sensores "
+                 "y exige 4 lecturas seguidas por encima del umbral.",
         )
+        st.button("↺ Restaurar valores por defecto", on_click=reset_defaults, width="stretch")
+        st.caption("Los valores por defecto reproducen la configuración principal. "
+                   "Los supuestos pueden modificarse para el análisis de sensibilidad.")
+        with st.expander("¿Qué afecta a qué?"):
+            st.markdown(
+                "**Cambian la franja de estado, la telemetría, las alertas y la réplica:** activo, escenario, duración, semilla, "
+                "ruido, pérdida de datos, umbral de intervención, método de detección, captura del error de posición, variación de carga y compensación de régimen.\n\n"
+                "**Cambian solo los indicadores (Monte Carlo y sensibilidad):** incremento del MTBF, reducción del MTTR y corridas.\n\n"
+                "**Los vincula** el panel «Sustento del supuesto» de la pestaña Sensibilidad: calcula cuántas fallas debe evitar "
+                "el gemelo para sostener el incremento del MTBF y lo compara con lo que logra la detección simulada."
+            )
+    return Controls(
+        asset_name=asset_name, scenario=scenario, policy=policy, duration=int(duration), seed=int(seed),
+        mtbf_gain=float(mtbf_gain), mttr_reduction=float(mttr_reduction), simulations=int(simulations),
+        noise_factor=float(noise_factor), missing_rate_pct=int(missing_rate_pct), intervention_pct=int(intervention_pct),
+        position_capture=position_capture, inspection_h=int(inspection_h), load_pct=int(load_pct),
+        failure_mode=failure_mode, compensate_load=bool(compensate_load), detection=detection,
+    )
 
-intervention_threshold = intervention_pct / 100
-missing_rate = missing_rate_pct / 100
-inspection_eff = float(inspection_h) if position_capture == CAPTURA_INSPECCION else 0.0
-extra = dict(load_variability=load_pct / 100, compensate_load=bool(compensate_load), inspection_h=inspection_eff,
-             failure_mode=failure_mode)
 
-# ---------------------------------------------------------------------------
-# Cálculos principales (en caché)
-# ---------------------------------------------------------------------------
-sim_args = (duration, int(seed), float(noise_factor), float(missing_rate), float(intervention_threshold), detection)
-df_re, alerts_re, idx_re = simulate_telemetry(asset_name, scenario, "Reactivo", *sim_args, **extra)
-df_pr, alerts_pr, idx_pr = simulate_telemetry(asset_name, scenario, "Predictivo", *sim_args, **extra)
-df, alerts, intervention_index = (df_re, alerts_re, idx_re) if policy == "Reactivo" else (df_pr, alerts_pr, idx_pr)
+# ===========================================================================
+# VISTA · TELEMETRY
+# ===========================================================================
 
-mc = monte_carlo(asset_name, mtbf_gain, mttr_reduction, int(simulations), int(seed))
-experiments = experiment_matrix(asset_name, *sim_args, **extra)
-asset = ASSETS[asset_name]
-operating, base_mtbf, base_mttr, base_availability = base_metrics(asset)
-
-det_mtbf = base_mtbf * (1 + mtbf_gain / 100)
-det_mttr = base_mttr * (1 - mttr_reduction / 100)
-det_availability = availability_pct(det_mtbf, det_mttr)
-
-if policy == "Predictivo":
-    projected_mtbf, projected_mttr = det_mtbf, det_mttr
-else:
-    projected_mtbf, projected_mttr = base_mtbf, base_mttr
-projected_availability = availability_pct(projected_mtbf, projected_mttr)
-projected_downtime = asset["scheduled_hours"] * (1 - projected_availability / 100)
-avoided_downtime = max(0.0, asset["downtime_hours"] - projected_downtime)
-completeness = data_quality(df, asset_name, inspection_eff > 0)
-
-# ---------------------------------------------------------------------------
-# Encabezado
-# ---------------------------------------------------------------------------
-st.markdown(
-    """
-    <div class="hero">
-      <div class="eyebrow">Industria 4.0 · TPM · Gemelos digitales consultivos</div>
-      <h1>Gemelos digitales de mantenimiento</h1>
-      <p>Un gemelo digital por equipo (CNC plasma y torno), con telemetría simulada, detección de degradación y evaluación de la política de mantenimiento.</p>
-    </div>
-    <div class="demo-note"><b>SIMULACIÓN ACADÉMICA:</b> las señales y los resultados TO-BE son escenarios calculados; no provienen de sensores instalados.</div>
-    """,
-    unsafe_allow_html=True,
-)
-
-hour_selected = st.slider(
-    "Instante de la simulación (hora simulada)", 0.0, float(duration), float(duration), step=1 / 12, format="%.2f h"
-)
-moment = int(min(max(round(hour_selected * 12), 0), len(df) - 1))
-hour_now = float(df.iloc[moment]["Hora simulada"])
-st.plotly_chart(timeline_figure(df_re, df_pr, alerts_re, alerts_pr, idx_pr, hour_now), width="stretch",
-                config={"displaylogo": False, "displayModeBar": False})
-st.caption("Franja de estado por política: verde = normal, amarillo = advertencia, rojo = crítico. ★ primera alerta; "
-           "◆ intervención propuesta por el gemelo. Cambia al mover el escenario, el ruido, la pérdida de datos, el umbral o el método de detección.")
-
-col_status, col_health, col_risk, col_data = st.columns([1.6, 1, 1, 1])
-status_now = str(df.iloc[moment]["Estado"])
-health_now = float(min(100.0, max(0.0, 100 - float(df.iloc[moment]["Degradación"]))))
-with col_status:
-    status_card(asset_name, status_now, health_now, hour_now)
-with col_health:
-    st.metric("Disponibilidad proyectada", f"{projected_availability:.2f}%", f"{projected_availability - base_availability:+.2f} pp")
-    st.metric("MTBF proyectado", f"{projected_mtbf:.2f} h", f"{projected_mtbf - base_mtbf:+.2f} h")
-with col_risk:
-    st.metric("MTTR proyectado", f"{projected_mttr:.2f} h", f"{projected_mttr - base_mttr:+.2f} h", delta_color="inverse")
-    st.metric("Parada potencial evitada", f"{avoided_downtime:.2f} h", "Periodo diagnóstico", delta_color="off")
-with col_data:
-    st.metric("Calidad de datos", f"{completeness:.2f}%", f"Meta ≥ {META_CALIDAD_DATOS:.0f}%", delta_color="off")
-    st.metric("Registros simulados", f"{len(df):,}", "Cada 5 min", delta_color="off")
-
-(tab_live, tab_replica, tab_compare, tab_sens, tab_alerts, tab_tests, tab_impl, tab_method) = st.tabs([
-    "📡 Telemetría", "🧊 Réplica virtual", "📊 Indicadores", "📈 Sensibilidad",
-    "⚠️ Alertas", "🧪 Pruebas", "🛠️ Implementación", "📘 Metodología",
-])
-
-# lecturas en el instante elegido (con la última lectura válida si el dato se perdió)
-readings = {}
-for variable in asset["variables"]:
-    readings[variable] = last_valid(df[variable], moment)
-
-# ---------------------------------------------------------------------------
-# Telemetría
-# ---------------------------------------------------------------------------
-with tab_live:
+def render_telemetry(c):
+    (asset, asset_name, df, hour_now, inspection_eff, readings) = (c.asset, c.asset_name, c.df, c.hour_now, c.inspection_eff, c.readings)
     st.markdown('<div class="section-title">Comportamiento virtual del activo</div>', unsafe_allow_html=True)
     st.caption("Línea amarilla: umbral de advertencia · Línea roja: umbral crítico · Línea gris vertical: instante elegido")
-    st.plotly_chart(telemetry_figure(df, asset_name, hour_now, inspection_eff > 0), width="stretch", config={"displaylogo": False})
+    st.plotly_chart(telemetry_figure(df, asset_name, hour_now, inspection_eff > 0), width="stretch", config=PLOTLY_CONFIG)
     columns = st.columns(4)
     for column, variable in zip(columns, asset["variables"]):
         value, age = readings[variable]
@@ -1161,19 +1277,22 @@ with tab_live:
         mime="text/csv",
     )
 
-# ---------------------------------------------------------------------------
-# Réplica virtual
-# ---------------------------------------------------------------------------
-with tab_replica:
+
+# ===========================================================================
+# VISTA · REPLICA
+# ===========================================================================
+
+def render_replica(c):
+    (asset, asset_name, df, health_now, hour_now, inspection_eff, moment, readings, status_now) = (c.asset, c.asset_name, c.df, c.health_now, c.hour_now, c.inspection_eff, c.moment, c.readings, c.status_now)
     st.markdown('<div class="section-title">Réplica virtual del equipo</div>', unsafe_allow_html=True)
-    st.caption("Modelo 3D construido a partir de fotos del equipo; las dimensiones son estimadas. Los marcadores indican los "
+    st.caption("Los marcadores indican los "
                "puntos de medición de la propuesta de instrumentación; su color, y el de las capas translúcidas sobre las piezas "
                "monitoreadas, refleja el estado de la lectura simulada en el instante elegido. El gabinete verde azulado es un "
                "elemento propuesto, aún no instalado. Los marcadores abiertos son los acelerómetros de contingencia: se instalan solo si se cumple el criterio de activación.")
     left, right = st.columns([2.1, 1])
     with left:
         figure, levels = replica_figure(asset_name, readings)
-        st.plotly_chart(figure, width="stretch", config={"displaylogo": False})
+        st.plotly_chart(figure, width="stretch", config=PLOTLY_CONFIG)
         legend = "".join(
             f'<span class="legend-dot" style="background:{LEVEL_COLOR[name]}"></span>{name}'
             for name in ["Normal", "Advertencia", "Crítico", "Sin dato"]
@@ -1211,12 +1330,15 @@ with tab_replica:
         })
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     st.caption("Los umbrales son demostrativos y se calibrarán con la línea base real y las especificaciones del fabricante. "
-               "Las cantidades de instrumentación están en la propuesta de implementación del TSP.")
+               "Las cantidades de instrumentación están en el plan de implementación.")
 
-# ---------------------------------------------------------------------------
-# Indicadores
-# ---------------------------------------------------------------------------
-with tab_compare:
+
+# ===========================================================================
+# VISTA · INDICATORS
+# ===========================================================================
+
+def render_indicators(c):
+    (alerts_pr, asset_name, det_availability, det_mtbf, df_pr, df_re, idx_pr, inspection_eff, mc, scenario, seed, simulations) = (c.alerts_pr, c.asset_name, c.det_availability, c.det_mtbf, c.df_pr, c.df_re, c.idx_pr, c.inspection_eff, c.mc, c.scenario, c.seed, c.simulations)
     st.markdown('<div class="section-title">Resultados de la simulación Monte Carlo</div>', unsafe_allow_html=True)
     st.caption(f"Resultado de {simulations} corridas por política. El incremento del MTBF y la reducción del MTTR "
                "son supuestos configurables, no resultados medidos.")
@@ -1238,9 +1360,9 @@ with tab_compare:
         fig_box.add_trace(go.Box(y=subset["Disponibilidad (%)"], name=policy_name, marker_color=colors[policy_name], showlegend=False), row=1, col=1)
         fig_box.add_trace(go.Box(y=subset["Horas de parada"], name=policy_name, marker_color=colors[policy_name], showlegend=False), row=1, col=2)
     fig_box.add_hline(y=META_DISPONIBILIDAD, line_dash="dash", line_color="#34d399", row=1, col=1)
-    fig_box.update_layout(height=430, paper_bgcolor="#0b1a2a", plot_bgcolor="#081522", font_color="#b8c7d9", margin=dict(l=20, r=20, t=55, b=20))
-    fig_box.update_yaxes(gridcolor="rgba(255,255,255,.06)")
-    st.plotly_chart(fig_box, width="stretch", config={"displaylogo": False})
+    fig_box.update_layout(height=430, **THEME, margin=dict(l=20, r=20, t=55, b=20))
+    fig_box.update_yaxes(gridcolor=GRID_COLOR)
+    st.plotly_chart(fig_box, width="stretch", config=PLOTLY_CONFIG)
     st.caption(f"Línea verde: meta de disponibilidad ({META_DISPONIBILIDAD} %).")
 
     st.markdown('<div class="section-title">Criterios de aceptación (en simulación)</div>', unsafe_allow_html=True)
@@ -1253,9 +1375,6 @@ with tab_compare:
     critical_hour_reactive = float(df_re.loc[critical_reactive[0], "Hora simulada"]) if critical_reactive else np.nan
     predictive_critical = bool((df_pr["Estado"] == "Crítico").any())
     intervention_hour = float(df_pr.loc[idx_pr, "Hora simulada"]) if idx_pr is not None else np.nan
-
-    def verdict(ok):
-        return "Cumple" if ok else "No cumple"
 
     criteria = [
         ("Calidad de datos", f"≥ {META_CALIDAD_DATOS:.0f} %", f"{data_quality(df_pr, asset_name, inspection_eff > 0):.2f} %", verdict(data_quality(df_pr, asset_name, inspection_eff > 0) >= META_CALIDAD_DATOS)),
@@ -1293,13 +1412,16 @@ with tab_compare:
             "- Los umbrales de vibración, temperatura y corriente (demostrativos)."
         )
 
-# ---------------------------------------------------------------------------
-# Sensibilidad
-# ---------------------------------------------------------------------------
-with tab_sens:
+
+# ===========================================================================
+# VISTA · SENSITIVITY
+# ===========================================================================
+
+def render_sensitivity(c):
+    (asset_name, base_mtbf, base_mttr, det_availability, det_mtbf, detection, mtbf_gain, mttr_reduction, scenario, seed, sim, simulations) = (c.asset_name, c.base_mtbf, c.base_mttr, c.det_availability, c.det_mtbf, c.detection, c.mtbf_gain, c.mttr_reduction, c.scenario, c.seed, c.sim, c.simulations)
     st.markdown('<div class="section-title">Qué supuestos hacen falta para cumplir las metas</div>', unsafe_allow_html=True)
     st.caption("Disponibilidad determinística = MTBF / (MTBF + MTTR). La línea roja marca la meta de disponibilidad; el punto blanco, el supuesto actual.")
-    st.plotly_chart(sensitivity_figure(asset_name, mtbf_gain, mttr_reduction), width="stretch", config={"displaylogo": False})
+    st.plotly_chart(sensitivity_figure(asset_name, mtbf_gain, mttr_reduction), width="stretch", config=PLOTLY_CONFIG)
 
     needed_gain = (META_MTBF / base_mtbf - 1) * 100
     needed_reduction = (1 - (base_mtbf * (1 - META_DISPONIBILIDAD / 100) / (META_DISPONIBILIDAD / 100)) / base_mttr) * 100
@@ -1328,9 +1450,9 @@ with tab_sens:
     fig_seed = go.Figure(go.Histogram(x=robust["MTBF (h)"], nbinsx=25, marker_color="#22d3ee"))
     fig_seed.add_vline(x=META_MTBF, line_dash="dash", line_color="#fb7185", annotation_text="Meta MTBF")
     fig_seed.add_vline(x=current_mtbf, line_color="#fbbf24", annotation_text=f"Semilla {int(seed)}", annotation_position="top left")
-    fig_seed.update_layout(height=340, paper_bgcolor="#0b1a2a", plot_bgcolor="#081522", font_color="#b8c7d9",
+    fig_seed.update_layout(height=340, **THEME,
                            margin=dict(l=20, r=20, t=30, b=20), xaxis_title="MTBF predictivo medio de cada semilla (h)", yaxis_title="Semillas")
-    st.plotly_chart(fig_seed, width="stretch", config={"displaylogo": False})
+    st.plotly_chart(fig_seed, width="stretch", config=PLOTLY_CONFIG)
     st.caption("Cada barra agrupa semillas distintas. Si el valor esperado del MTBF queda cerca de la meta, que se cumpla o no "
                "depende de la semilla. Conviene reportar el promedio entre semillas y la probabilidad de cumplir, no un solo valor.")
 
@@ -1362,8 +1484,7 @@ with tab_sens:
         )
         st.caption("Clasificación propuesta a partir de la descripción de cada falla; debe validarla el jefe de Mantenimiento. "
                    "La anticipación de las fallas que solo se detectan por inspección depende de la frecuencia de esa inspección, que la simulación aún no modela.")
-    perf = detection_performance(asset_name, scenario, duration, float(noise_factor), float(missing_rate),
-                                 float(intervention_threshold), detection, float(min_lead_h), **extra)
+    perf = detection_performance(sim, float(min_lead_h))
     f_required = 1 - 1 / (1 + mtbf_gain / 100)
     f_achievable = (p_prog / 100) * perf["p_anticipada"] if not np.isnan(perf["p_anticipada"]) else float("nan")
     m1, m2, m3, m4 = st.columns(4)
@@ -1381,32 +1502,35 @@ with tab_sens:
         st.error(f"El supuesto no queda sustentado con esta configuración: el gemelo evitaría {f_achievable * 100:.1f} % de las fallas "
                  f"y se necesita {f_required * 100:.1f} %. Se requiere más fallas progresivas, más aviso o un umbral que anticipe más.")
     st.warning("Cota optimista: las señales son sintéticas y la operación normal simulada no incluye variación de carga, de velocidad ni de material. "
-               "En planta, la anticipación será menor y habrá falsas alarmas; por eso el TSP prevé seis semanas de captura pasiva para fijar el perfil normal por régimen.")
+               "En planta, la anticipación será menor y habrá falsas alarmas; por eso el plan prevé seis semanas de captura pasiva para fijar el perfil normal por régimen.")
     st.caption(f"Resultado con {perf['fallas']} trayectorias que llegan a condición crítica sin intervenir ({'escenario Desgaste progresivo' if scenario == 'Operación normal' else 'escenario ' + scenario}). "
                "Aviso = horas entre la intervención propuesta y la condición crítica que se habría alcanzado. "
                "La reducción del MTTR es un supuesto aparte: depende de contar con el repuesto reservado (Componente 1) y de programar la intervención en una pausa de turno.")
-    if detection == DETECCION_TSP:
-        st.info("Con el método «versión del TSP» las falsas alarmas son 0 por construcción, porque el umbral se evalúa sobre el estado interno del simulador. "
+    if detection == DETECCION_ESTADO:
+        st.info("Con el método «estado interno» las falsas alarmas son 0 por construcción, porque el umbral se evalúa sobre el estado interno del simulador. "
                 "Para medirlas con las lecturas, cambia el método de detección a «Estimado desde lecturas de sensores».")
     with st.expander("Compromiso del umbral de intervención (método por lecturas)"):
         st.caption("Un umbral más bajo da más aviso pero aumenta las falsas alarmas. Se calcula con 60 trayectorias por umbral, con el ruido y la pérdida de datos actuales.")
         if st.button("Calcular curva del umbral"):
-            curve = threshold_tradeoff(asset_name, scenario, duration, float(noise_factor), float(missing_rate), float(min_lead_h), **extra)
+            curve = threshold_tradeoff(sim, float(min_lead_h))
             fig_curve = go.Figure()
             fig_curve.add_trace(go.Scatter(x=curve["Umbral (%)"], y=curve["Fallas anticipadas (%)"], mode="lines+markers",
                                            name="Fallas anticipadas (%)", line=dict(color="#22d3ee")))
             fig_curve.add_trace(go.Scatter(x=curve["Umbral (%)"], y=curve["Falsas alarmas (%)"], mode="lines+markers",
                                            name="Falsas alarmas (%)", line=dict(color="#fb7185")))
-            fig_curve.update_layout(height=340, paper_bgcolor="#0b1a2a", plot_bgcolor="#081522", font_color="#b8c7d9",
+            fig_curve.update_layout(height=340, **THEME,
                                     margin=dict(l=20, r=20, t=30, b=20), xaxis_title="Umbral de intervención (% de degradación)",
                                     yaxis_title="%", legend=dict(orientation="h", y=1.12))
-            st.plotly_chart(fig_curve, width="stretch", config={"displaylogo": False})
+            st.plotly_chart(fig_curve, width="stretch", config=PLOTLY_CONFIG)
             st.dataframe(curve.round(2), hide_index=True, width="stretch")
 
-# ---------------------------------------------------------------------------
-# Alertas
-# ---------------------------------------------------------------------------
-with tab_alerts:
+
+# ===========================================================================
+# VISTA · ALERTS
+# ===========================================================================
+
+def render_alerts(c):
+    (alerts, asset, asset_name, df, df_pr, df_re, duration, idx_pr, intervention_index) = (c.alerts, c.asset, c.asset_name, c.df, c.df_pr, c.df_re, c.duration, c.idx_pr, c.intervention_index)
     st.markdown('<div class="section-title">Registro de eventos predictivos</div>', unsafe_allow_html=True)
     if alerts.empty:
         st.success("No se detectaron anomalías durante el escenario seleccionado.")
@@ -1461,10 +1585,13 @@ with tab_alerts:
             else:
                 st.info("Pendiente de revisión. El gemelo es consultivo: no envía comandos a la máquina.")
 
-# ---------------------------------------------------------------------------
-# Pruebas
-# ---------------------------------------------------------------------------
-with tab_tests:
+
+# ===========================================================================
+# VISTA · TESTS
+# ===========================================================================
+
+def render_tests(c):
+    (asset, completeness, experiments) = (c.asset, c.completeness, c.experiments)
     st.markdown("### Matriz automática de experimentos")
     st.caption("Compara los tres estados de degradación bajo política reactiva y predictiva con la misma configuración de robustez. "
                "Cada experimento usa una semilla distinta (semilla + 17 por experimento).")
@@ -1478,12 +1605,14 @@ with tab_tests:
     if completeness < META_CALIDAD_DATOS:
         st.error("La completitud es menor a 95 %. El ensayo debe considerarse no conforme hasta corregir la pérdida de datos.")
     else:
-        st.success("La calidad de datos cumple el criterio académico propuesto de ≥95 %.")
+        st.success("La calidad de datos cumple el criterio propuesto de ≥95 %.")
 
-# ---------------------------------------------------------------------------
-# Implementación
-# ---------------------------------------------------------------------------
-with tab_impl:
+
+# ===========================================================================
+# VISTA · IMPLEMENTATION
+# ===========================================================================
+
+def render_implementation(c):
     st.markdown("### Qué necesita la empresa para conectar el gemelo")
     st.markdown(
         """
@@ -1505,10 +1634,12 @@ with tab_impl:
     st.warning("Esta plataforma evalúa la lógica del gemelo con datos simulados. Al implementarla, los umbrales deben "
                "calibrarse con la línea base real del equipo y las especificaciones del fabricante.")
 
-# ---------------------------------------------------------------------------
-# Metodología
-# ---------------------------------------------------------------------------
-with tab_method:
+
+# ===========================================================================
+# VISTA · METHODOLOGY
+# ===========================================================================
+
+def render_methodology(c):
     st.markdown("### Diseño de validación")
     st.markdown(
         """
@@ -1536,11 +1667,11 @@ with tab_method:
     st.markdown(
         """
         - Las señales son sintéticas y se generan a partir de la línea base del diagnóstico; no provienen de sensores instalados.
-        - El error de posición del CNC se simula cada 5 minutos en la versión del TSP; con la captura «por inspección TPM» solo existe en cada inspección, como ocurre en planta (el controlador no lo exporta), y se excluye de la calidad de datos de sensores.
-        - En el método «estimado desde lecturas», el gemelo aprende el perfil normal con las primeras 4 horas y lo recalibra con las 4 horas posteriores a cada intervención; con el método del TSP usa las constantes del diagnóstico.
+        - El error de posición del CNC se simula cada 5 minutos en el modo por defecto; con la captura «por inspección TPM» solo existe en cada inspección, como ocurre en planta (el controlador no lo exporta), y se excluye de la calidad de datos de sensores.
+        - En el método «estimado desde lecturas», el gemelo aprende el perfil normal con las primeras 4 horas y lo recalibra con las 4 horas posteriores a cada intervención; con el método de estado interno usa las constantes del diagnóstico.
         - La variación de la carga operativa mueve las lecturas sin que haya degradación; con la compensación de régimen el gemelo descuenta la carga conocida, salvo un 20 % de error.
         - El incremento del MTBF y la reducción del MTTR son supuestos configurables. La simulación no los calcula a partir de la detección.
-        - En el método "versión del TSP", el cruce del umbral se evalúa sobre el estado interno del simulador y se agregan 4 intervalos de espera. El método "estimado desde lecturas" usa solo las lecturas y exige 4 seguidas por encima del umbral.
+        - En el método "estado interno", el cruce del umbral se evalúa sobre el estado interno del simulador y se agregan 4 intervalos de espera. El método "estimado desde lecturas" usa solo las lecturas y exige 4 seguidas por encima del umbral.
         - La dispersión del Monte Carlo (formas gamma 9 y 8) es un supuesto del modelo.
         - Los umbrales de vibración, temperatura y corriente son demostrativos y deben calibrarse con mediciones normales del equipo, especificaciones del fabricante y evaluación técnica.
         - La reducción del MTTR y la proporción de fallas con degradación progresiva son supuestos; el panel «Sustento del supuesto» muestra cuánto debe lograr la detección para sostener el incremento del MTBF.
@@ -1549,38 +1680,141 @@ with tab_method:
         """
     )
 
-# ---------------------------------------------------------------------------
-# Configuración exportable y pie
-# ---------------------------------------------------------------------------
-config_export = {
-    "version_app": APP_VERSION,
-    "generado": datetime.now().isoformat(timespec="seconds"),
-    "activo": asset_name,
-    "escenario": scenario,
-    "politica": policy,
-    "duracion_h": duration,
-    "semilla": int(seed),
-    "incremento_mtbf_pct": mtbf_gain,
-    "reduccion_mttr_pct": mttr_reduction,
-    "corridas_monte_carlo": int(simulations),
-    "ruido_sensor": noise_factor,
-    "perdida_datos_pct": missing_rate_pct,
-    "umbral_intervencion_pct": intervention_pct,
-    "metodo_deteccion": detection,
-    "captura_error_posicion": position_capture,
-    "intervalo_inspeccion_h": inspection_eff,
-    "variacion_carga_pct": load_pct,
-    "compensar_regimen": bool(compensate_load),
-    "modo_falla": failure_mode,
-}
-with st.sidebar:
-    st.download_button(
-        "⬇ Descargar configuración (JSON)",
-        data=json.dumps(config_export, ensure_ascii=False, indent=2).encode("utf-8"),
-        file_name="configuracion_simulacion.json",
-        mime="application/json",
-        width="stretch",
+
+# ===========================================================================
+# APLICACIÓN
+# ===========================================================================
+
+# Orden de VIEWS -> módulo que dibuja cada vista
+RENDERERS = dict(zip(VIEWS, (render_telemetry, render_replica, render_indicators, render_sensitivity,
+                           render_alerts, render_tests, render_implementation, render_methodology)))
+# Controles que viven dentro de una vista: se conservan al cambiar de vista (Streamlit descarta
+# el estado de los widgets que no se dibujan en una ejecución).
+VIEW_KEYS = ("p_prog", "min_lead_h")
+
+st.set_page_config(page_title=APP_TITLE, page_icon="⚙️", layout="wide", initial_sidebar_state="expanded")
+inject_css()
+
+
+def keep_view_state() -> None:
+    for key in list(st.session_state.keys()):
+        if key in VIEW_KEYS or key.startswith("decision_"):
+            st.session_state[key] = st.session_state[key]
+
+
+def build_context(ctl) -> SimpleNamespace:
+    """Calcula una sola vez los resultados que comparten todas las vistas."""
+    sim = SimConfig(
+        asset_name=ctl.asset_name, scenario=ctl.scenario, duration=ctl.duration, seed=ctl.seed,
+        noise_factor=ctl.noise_factor, missing_rate=ctl.missing_rate,
+        intervention_threshold=ctl.intervention_threshold, detection=ctl.detection,
+        load_variability=ctl.load_pct / 100, compensate_load=ctl.compensate_load,
+        inspection_h=ctl.inspection_eff, failure_mode=ctl.failure_mode,
+    )
+    df_re, alerts_re, idx_re = simulate_telemetry(sim, "Reactivo")
+    df_pr, alerts_pr, idx_pr = simulate_telemetry(sim, "Predictivo")
+    df, alerts, intervention_index = (df_re, alerts_re, idx_re) if ctl.policy == "Reactivo" else (df_pr, alerts_pr, idx_pr)
+
+    asset = ASSETS[ctl.asset_name]
+    operating, base_mtbf, base_mttr, base_availability = base_metrics(asset)
+    det_mtbf = base_mtbf * (1 + ctl.mtbf_gain / 100)
+    det_mttr = base_mttr * (1 - ctl.mttr_reduction / 100)
+    det_availability = availability_pct(det_mtbf, det_mttr)
+    projected_mtbf, projected_mttr = (det_mtbf, det_mttr) if ctl.policy == "Predictivo" else (base_mtbf, base_mttr)
+    projected_availability = availability_pct(projected_mtbf, projected_mttr)
+    projected_downtime = asset["scheduled_hours"] * (1 - projected_availability / 100)
+
+    return SimpleNamespace(
+        sim=sim, asset=asset, df_re=df_re, alerts_re=alerts_re, idx_re=idx_re, df_pr=df_pr, alerts_pr=alerts_pr,
+        idx_pr=idx_pr, df=df, alerts=alerts, intervention_index=intervention_index,
+        mc=monte_carlo(ctl.asset_name, ctl.mtbf_gain, ctl.mttr_reduction, ctl.simulations, ctl.seed),
+        experiments=experiment_results(sim),
+        operating=operating, base_mtbf=base_mtbf, base_mttr=base_mttr, base_availability=base_availability,
+        det_mtbf=det_mtbf, det_mttr=det_mttr, det_availability=det_availability,
+        projected_mtbf=projected_mtbf, projected_mttr=projected_mttr, projected_availability=projected_availability,
+        projected_downtime=projected_downtime,
+        avoided_downtime=max(0.0, asset["downtime_hours"] - projected_downtime),
+        completeness=data_quality(df, ctl.asset_name, ctl.inspection_eff > 0),
+        inspection_eff=ctl.inspection_eff,
+        # parámetros de los controles que usan las vistas
+        asset_name=ctl.asset_name, scenario=ctl.scenario, policy=ctl.policy, duration=ctl.duration, seed=ctl.seed,
+        mtbf_gain=ctl.mtbf_gain, mttr_reduction=ctl.mttr_reduction, simulations=ctl.simulations,
+        detection=ctl.detection,
     )
 
-st.markdown("---")
-st.caption(f"Propuesta académica de gemelo digital consultivo · Datos simulados · v{APP_VERSION}")
+
+def render_header(c) -> None:
+    st.markdown(
+        """
+        <div class="hero">
+          <div class="eyebrow">Industria 4.0 · TPM · Gemelos digitales consultivos</div>
+          <h1>Gemelos digitales de mantenimiento</h1>
+          <p>Un gemelo digital por equipo (CNC plasma y torno), con telemetría simulada, detección de degradación y evaluación de la política de mantenimiento.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    hour_selected = st.slider(
+        "Instante de la simulación (hora simulada)", 0.0, float(c.duration), float(c.duration),
+        step=1 / SAMPLES_PER_HOUR, format="%.2f h",
+    )
+    c.moment = int(min(max(round(hour_selected * SAMPLES_PER_HOUR), 0), len(c.df) - 1))
+    c.hour_now = float(c.df.iloc[c.moment]["Hora simulada"])
+    st.plotly_chart(timeline_figure(c.df_re, c.df_pr, c.alerts_re, c.alerts_pr, c.idx_pr, c.hour_now),
+                    width="stretch", config=PLOTLY_CONFIG_BARE)
+    st.caption("Franja de estado por política: verde = normal, amarillo = advertencia, rojo = crítico. ★ primera alerta; "
+               "◆ intervención propuesta por el gemelo. Cambia al mover el escenario, el ruido, la pérdida de datos, el umbral o el método de detección.")
+
+    c.status_now = str(c.df.iloc[c.moment]["Estado"])
+    c.health_now = float(min(100.0, max(0.0, 100 - float(c.df.iloc[c.moment]["Degradación"]))))
+    col_status, col_health, col_risk, col_data = st.columns([1.6, 1, 1, 1])
+    with col_status:
+        status_card(c.asset_name, c.status_now, c.health_now, c.hour_now)
+    with col_health:
+        st.metric("Disponibilidad proyectada", f"{c.projected_availability:.2f}%", f"{c.projected_availability - c.base_availability:+.2f} pp")
+        st.metric("MTBF proyectado", f"{c.projected_mtbf:.2f} h", f"{c.projected_mtbf - c.base_mtbf:+.2f} h")
+    with col_risk:
+        st.metric("MTTR proyectado", f"{c.projected_mttr:.2f} h", f"{c.projected_mttr - c.base_mttr:+.2f} h", delta_color="inverse")
+        st.metric("Parada potencial evitada", f"{c.avoided_downtime:.2f} h", "Periodo diagnóstico", delta_color="off")
+    with col_data:
+        st.metric("Calidad de datos", f"{c.completeness:.2f}%", f"Meta ≥ {META_CALIDAD_DATOS:.0f}%", delta_color="off")
+        st.metric("Registros simulados", f"{len(c.df):,}", "Cada 5 min", delta_color="off")
+
+    # lecturas en el instante elegido (última lectura válida si el dato se perdió)
+    c.readings = {v: last_valid(c.df[v], c.moment) for v in c.asset["variables"]}
+
+
+def render_config_download(ctl) -> None:
+    export = {
+        "version_app": APP_VERSION,
+        "generado": datetime.now().isoformat(timespec="seconds"),
+        "activo": ctl.asset_name, "escenario": ctl.scenario, "politica": ctl.policy,
+        "duracion_h": ctl.duration, "semilla": ctl.seed,
+        "incremento_mtbf_pct": ctl.mtbf_gain, "reduccion_mttr_pct": ctl.mttr_reduction,
+        "corridas_monte_carlo": ctl.simulations, "ruido_sensor": ctl.noise_factor,
+        "perdida_datos_pct": ctl.missing_rate_pct, "umbral_intervencion_pct": ctl.intervention_pct,
+        "metodo_deteccion": ctl.detection, "captura_error_posicion": ctl.position_capture,
+        "intervalo_inspeccion_h": ctl.inspection_eff, "variacion_carga_pct": ctl.load_pct,
+        "compensar_regimen": ctl.compensate_load, "modo_falla": ctl.failure_mode,
+    }
+    with st.sidebar:
+        st.download_button(
+            "⬇ Descargar configuración (JSON)",
+            data=json.dumps(export, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name="configuracion_simulacion.json", mime="application/json", width="stretch",
+        )
+
+
+def main() -> None:
+    keep_view_state()
+    controls = render_sidebar()
+    ctx = build_context(controls)
+    render_header(ctx)
+    view = st.radio("Vista", VIEWS, horizontal=True, label_visibility="collapsed", key="view")
+    RENDERERS[view](ctx)       # solo se calcula y dibuja la vista activa
+    render_config_download(controls)
+    st.markdown("---")
+    st.caption(f"Gemelo digital consultivo · Datos simulados · v{APP_VERSION}")
+
+
+main()
