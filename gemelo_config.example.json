@@ -1,0 +1,8 @@
+{
+  "Torno": {
+    "RPM": {"warning": 820, "critical": 770}
+  },
+  "CNC plasma": {
+    "Temperatura (°C)": {"warning": 66, "critical": 76}
+  }
+}

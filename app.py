@@ -1,18 +1,34 @@
 """Gemelo digital consultivo para mantenimiento (TPM) · CNC plasma y torno.
 
-Las señales son sintéticas y se generan a partir de la línea base del diagnóstico. Para operar con
-datos reales, `run_simulation` se sustituye por la lectura del gateway (MQTT / OPC UA); el resto de la
-plataforma no cambia.
+Funciona con señales simuladas (para evaluar el gemelo) o con lecturas reales cargadas desde un CSV.
+Para conectar un gateway (MQTT / OPC UA), basta con volcar sus lecturas al formato del CSV de entrada
+o reemplazar `parse_csv` por un lector del gateway: el análisis posterior no cambia.
+
+Configuración por variables de entorno (ver README): GEMELO_DATA_DIR, GEMELO_CONFIG, GEMELO_USERS,
+GEMELO_SMTP_*, GEMELO_MAIL_TO, GEMELO_WEBHOOK_URL.
 
 Ejecución:  streamlit run app.py
 """
-from dataclasses import dataclass
-from dataclasses import replace
+from contextlib import contextmanager
+import copy
+from dataclasses import dataclass, replace
 from datetime import datetime
+from email.message import EmailMessage
+import hashlib
+import hmac
+import io
 import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+from pathlib import Path
+import smtplib
+import sqlite3
+import time
 from types import SimpleNamespace
-from typing import Callable
-from typing import NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
+import unicodedata
+import urllib.request
 
 import numpy as np
 import pandas as pd
@@ -25,7 +41,7 @@ import streamlit as st
 # CONFIG
 # ===========================================================================
 
-APP_VERSION = "1.6"
+APP_VERSION = "2.0"
 APP_TITLE = "Gemelos Digitales · TPM"
 
 # Metas de aceptación
@@ -52,8 +68,15 @@ CAPTURA_CONTINUA = "Continua cada 5 min"
 CAPTURA_INSPECCION = "Por inspección TPM"
 
 # Vistas principales (navegación)
-VIEWS = ["📡 Telemetría", "🧊 Réplica virtual", "📊 Indicadores", "📈 Sensibilidad",
-         "⚠️ Alertas", "🧪 Pruebas", "🛠️ Implementación", "📘 Metodología"]
+SIMULACION = "Simulación"
+DATOS_REALES = "Datos reales (CSV)"
+DATA_SOURCES = [SIMULACION, DATOS_REALES]
+
+# Vistas principales (navegación). La de configuración solo la ve quien tiene permiso de configurar.
+V_TELEMETRIA, V_REPLICA, V_ALERTAS = "📡 Telemetría", "🧊 Réplica virtual", "⚠️ Alertas"
+V_HISTORIAL, V_INDICADORES, V_ANALISIS = "🗂️ Historial", "📊 Indicadores", "📈 Análisis"
+V_CONFIG, V_AYUDA = "⚙️ Configuración", "❓ Ayuda"
+VIEWS = [V_TELEMETRIA, V_REPLICA, V_ALERTAS, V_HISTORIAL, V_INDICADORES, V_ANALISIS, V_CONFIG, V_AYUDA]
 
 
 # Sensibilidad de cada variable a la carga operativa: a plena carga y con variación de 100 %, la lectura sube
@@ -72,6 +95,7 @@ MODOS_FALLA = {
 
 # Valores por defecto de los controles
 DEFAULTS = {
+    "data_source": SIMULACION,
     "asset_name": "CNC plasma",
     "scenario": "Falla acelerada",
     "policy": "Reactivo",
@@ -94,6 +118,38 @@ DEFAULTS = {
 }
 
 LEVEL_COLOR = {"Normal": "#34d399", "Advertencia": "#fbbf24", "Crítico": "#fb7185", "Sin dato": "#64748b"}
+
+
+# ===========================================================================
+# SETTINGS
+# ===========================================================================
+
+DATA_DIR = Path(os.environ.get("GEMELO_DATA_DIR", "data"))
+CONFIG_PATH = Path(os.environ.get("GEMELO_CONFIG", "gemelo_config.json"))
+USERS_PATH = Path(os.environ.get("GEMELO_USERS", "users.json"))
+DB_PATH = DATA_DIR / "gemelo.db"
+LOG_PATH = DATA_DIR / "gemelo.log"
+
+
+def get_logger() -> logging.Logger:
+    """Logger de la aplicación: consola y archivo rotativo (si el directorio de datos es escribible)."""
+    logger = logging.getLogger("gemelo")
+    if logger.handlers:
+        return logger
+    logger.setLevel(os.environ.get("GEMELO_LOG_LEVEL", "INFO").upper())
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    logger.addHandler(console)
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError:
+        logger.warning("No se pudo crear el archivo de registro en %s", DATA_DIR)
+    logger.propagate = False
+    return logger
 
 
 # ===========================================================================
@@ -202,6 +258,10 @@ EQUIPMENT_SPECS = {
 }
 
 
+# Umbrales de fábrica: sirven para restaurar los valores si se editan desde la configuración.
+ASSETS_FACTORY = copy.deepcopy(ASSETS)
+
+
 # ===========================================================================
 # THEME
 # ===========================================================================
@@ -298,6 +358,7 @@ class SimConfig:
     compensate_load: bool = False
     inspection_h: float = 0.0
     failure_mode: str = MODO_TODAS
+    thresholds_id: str = ""      # huella de los umbrales vigentes: invalida el caché al cambiarlos
 
     def __post_init__(self):
         if self.asset_name not in ASSETS:
@@ -371,6 +432,43 @@ def persistent_hit(above, intervals=PERSISTENCE_INTERVALS):
     run = pd.Series(above.astype(int)).rolling(intervals).sum().to_numpy()
     hits = np.where(run >= intervals)[0]
     return int(hits[0]) if len(hits) else None
+
+
+NIVEL_INTERVENCION_EJECUTADA = "Intervención ejecutada"
+NIVEL_INTERVENCION_PROPUESTA = "Intervención propuesta"
+
+
+def is_intervention(level) -> bool:
+    return str(level).startswith("Intervención")
+
+
+def classify_readings(hours, observed_all, asset, full=True):
+    """Estado de cada instante (peor nivel entre las variables) y primera alerta de cada variable."""
+    statuses = np.full(len(hours), "Normal", dtype=object)
+    alerts = []
+    for variable, spec in asset["variables"].items():
+        observed = np.asarray(observed_all[variable], dtype=float)
+        with np.errstate(invalid="ignore"):
+            if spec["direction"] == "high":
+                warning_mask = observed >= spec["warning"]
+                critical_mask = observed >= spec["critical"]
+            else:
+                warning_mask = observed <= spec["warning"]
+                critical_mask = observed <= spec["critical"]
+        statuses[warning_mask] = "Advertencia"
+        statuses[critical_mask] = "Crítico"
+        if full:
+            warning_positions = np.where(warning_mask)[0]
+            if len(warning_positions):
+                idx = int(warning_positions[0])
+                alerts.append({
+                    "Hora": round(float(hours[idx]), 2),
+                    "Variable": variable,
+                    "Lectura": round(float(observed[idx]), 3),
+                    "Umbral": spec["warning"],
+                    "Nivel": "Crítico" if critical_mask[idx] else "Advertencia",
+                })
+    return statuses, alerts
 
 
 def run_simulation(sim: SimConfig, policy: str, full: bool = True) -> Telemetry:
@@ -465,30 +563,7 @@ def run_simulation(sim: SimConfig, policy: str, full: bool = True) -> Telemetry:
             )
 
     observed_all = observe(degradation)
-    statuses = np.full(points, "Normal", dtype=object)
-    alerts = []
-
-    for variable, spec in asset["variables"].items():
-        observed = observed_all[variable]
-        if spec["direction"] == "high":
-            warning_mask = observed >= spec["warning"]
-            critical_mask = observed >= spec["critical"]
-        else:
-            warning_mask = observed <= spec["warning"]
-            critical_mask = observed <= spec["critical"]
-        statuses[warning_mask] = "Advertencia"
-        statuses[critical_mask] = "Crítico"
-        if full:
-            warning_positions = np.where(warning_mask)[0]
-            if len(warning_positions):
-                idx = int(warning_positions[0])
-                alerts.append({
-                    "Hora": round(float(hours[idx]), 2),
-                    "Variable": variable,
-                    "Lectura": round(float(observed[idx]), 3),
-                    "Umbral": spec["warning"],
-                    "Nivel": "Crítico" if critical_mask[idx] else "Advertencia",
-                })
+    statuses, alerts = classify_readings(hours, observed_all, asset, full)
 
     if intervention_index is not None:
         statuses[intervention_index:] = "Normal"
@@ -498,7 +573,7 @@ def run_simulation(sim: SimConfig, policy: str, full: bool = True) -> Telemetry:
                 "Variable": "Mantenimiento",
                 "Lectura": 0.0,
                 "Umbral": 0.0,
-                "Nivel": "Intervención ejecutada",
+                "Nivel": NIVEL_INTERVENCION_EJECUTADA,
             })
 
     if not full:
@@ -545,6 +620,87 @@ def data_quality(df, asset_name, exclude_manual=False):
 
 
 # ===========================================================================
+# THRESHOLDS
+# ===========================================================================
+
+EDITABLE = ("warning", "critical")
+
+
+def validate_thresholds(direction: str, base: float, warning: float, critical: float) -> list:
+    """Devuelve la lista de errores (vacía si los umbrales son coherentes con la dirección de la degradación)."""
+    errors = []
+    if direction == "high":
+        if not base < warning < critical:
+            errors.append("Debe cumplirse: valor normal < advertencia < crítico.")
+    else:
+        if not base > warning > critical:
+            errors.append("Debe cumplirse: valor normal > advertencia > crítico.")
+    return errors
+
+
+def load_overrides(path: Path) -> dict:
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"El archivo de umbrales {path} no es un JSON válido: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("El archivo de umbrales debe ser un objeto JSON {equipo: {variable: {...}}}.")
+    return data
+
+
+def apply_overrides(assets: dict, overrides: dict) -> list:
+    """Aplica los umbrales del archivo a `assets` (en el sitio). Devuelve mensajes sobre lo aplicado o ignorado."""
+    messages = []
+    for asset_name, variables in overrides.items():
+        if asset_name not in assets:
+            messages.append(f"Equipo desconocido ignorado: {asset_name}")
+            continue
+        for variable, values in variables.items():
+            spec = assets[asset_name]["variables"].get(variable)
+            if spec is None:
+                messages.append(f"Variable desconocida ignorada: {asset_name} / {variable}")
+                continue
+            new = {k: float(values[k]) for k in EDITABLE if k in values}
+            warning, critical = new.get("warning", spec["warning"]), new.get("critical", spec["critical"])
+            errors = validate_thresholds(spec["direction"], spec["base"], warning, critical)
+            if errors:
+                messages.append(f"{asset_name} / {variable}: {errors[0]} Se conservan los valores por defecto.")
+                continue
+            spec.update(new)
+            messages.append(f"{asset_name} / {variable}: advertencia {warning}, crítico {critical}")
+    return messages
+
+
+def save_overrides(path: Path, overrides: dict) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(overrides, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def fingerprint(assets: dict) -> str:
+    """Huella corta de los umbrales vigentes: sirve como parte de la llave de caché."""
+    payload = {a: {v: [s["warning"], s["critical"]] for v, s in spec["variables"].items()} for a, spec in assets.items()}
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:10]
+
+
+def snapshot_defaults(assets: dict) -> dict:
+    return copy.deepcopy(assets)
+
+
+def reload_thresholds(assets: dict, factory: dict, path: Path) -> list:
+    """Vuelve a los umbrales de fábrica y aplica encima los del archivo. Se llama en cada ejecución (es barato e idempotente)."""
+    for asset_name, spec in factory.items():
+        for variable, values in spec["variables"].items():
+            assets[asset_name]["variables"][variable].update({k: values[k] for k in EDITABLE})
+    return apply_overrides(assets, load_overrides(path))
+
+
+# ===========================================================================
 # DETECTION
 # ===========================================================================
 
@@ -560,6 +716,7 @@ def reference_config(sim: SimConfig) -> SimConfig:
     return SimConfig(
         asset_name=sim.asset_name, scenario=failing_scenario(sim), duration=sim.duration, seed=0,
         noise_factor=sim.noise_factor, missing_rate=sim.missing_rate, failure_mode=sim.failure_mode,
+        thresholds_id=sim.thresholds_id,
     )
 
 
@@ -625,7 +782,7 @@ def experiment_matrix(sim: SimConfig, simulate: Callable = simulate_frames) -> p
             trial, trial_alerts, trial_intervention = simulate(run_cfg, policy_name)
             critical = trial.index[trial["Estado"] == "Crítico"].tolist()
             predictive_alerts = (
-                trial_alerts[trial_alerts["Nivel"] != "Intervención ejecutada"]
+                trial_alerts[~trial_alerts["Nivel"].map(is_intervention)]
                 if not trial_alerts.empty and "Nivel" in trial_alerts.columns
                 else pd.DataFrame()
             )
@@ -691,6 +848,363 @@ def seed_means(asset_name, mtbf_gain, mttr_reduction, simulations, n_seeds=100) 
 
 
 # ===========================================================================
+# INGEST
+# ===========================================================================
+
+TIME_NAMES = {"timestamp", "fecha", "fechahora", "fecha_hora", "hora", "time", "datetime", "tiempo"}
+MAX_POINTS = 20_000                      # ~69 días a una lectura cada 5 min
+MIN_HOURS = LEARN_H + 1                  # el perfil normal se aprende con las primeras horas
+
+
+class IngestError(ValueError):
+    """El archivo no se puede interpretar; el mensaje está pensado para mostrarse al usuario."""
+
+
+def _normalize(name: str) -> str:
+    text = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode("ascii").lower().strip()
+    return text.split("(")[0].strip().replace("_", " ")
+
+
+def _to_number(series: pd.Series) -> pd.Series:
+    if series.dtype == object:
+        series = series.astype(str).str.strip().str.replace(",", ".", regex=False)
+    return pd.to_numeric(series, errors="coerce")
+
+
+def parse_csv(data: bytes, asset_name: str) -> pd.DataFrame:
+    """Lee el CSV y devuelve una lectura cada 5 min (columnas: 'Horas' y una por variable; vacío = dato perdido)."""
+    if asset_name not in ASSETS:
+        raise IngestError(f"Equipo desconocido: {asset_name}")
+    if not data:
+        raise IngestError("El archivo está vacío.")
+    try:
+        raw = pd.read_csv(io.BytesIO(data), sep=None, engine="python")
+    except Exception as exc:  # noqa: BLE001
+        raise IngestError(f"No se pudo leer el CSV: {exc}") from exc
+    if raw.shape[1] < 2 or raw.empty:
+        raise IngestError("El CSV debe tener una columna de tiempo y una columna por variable.")
+
+    lookup = {_normalize(c): c for c in raw.columns}
+    time_col = next((lookup[k] for k in lookup if k in TIME_NAMES), raw.columns[0])
+
+    columns = {}
+    missing = []
+    for variable in ASSETS[asset_name]["variables"]:
+        source = lookup.get(_normalize(variable))
+        if source is None or source == time_col:
+            missing.append(variable)
+        else:
+            columns[variable] = source
+    if missing:
+        raise IngestError(
+            f"Faltan columnas para {asset_name}: {', '.join(missing)}. "
+            f"Columnas encontradas: {', '.join(map(str, raw.columns))}."
+        )
+
+    if pd.api.types.is_numeric_dtype(raw[time_col]):
+        hours = raw[time_col].astype(float).to_numpy()
+    else:
+        stamps = pd.to_datetime(raw[time_col], errors="coerce", format="ISO8601")      # 2026-01-31 08:05:00
+        if stamps.isna().mean() > 0.01:
+            stamps = pd.to_datetime(raw[time_col], errors="coerce", dayfirst=True)     # 31/01/2026 08:05
+        if stamps.isna().mean() > 0.01:
+            raise IngestError(f"La columna de tiempo '{time_col}' tiene fechas que no se pueden interpretar.")
+        hours = ((stamps - stamps.min()).dt.total_seconds() / 3600.0).to_numpy()
+
+    frame = pd.DataFrame({"Horas": hours, **{v: _to_number(raw[c]) for v, c in columns.items()}})
+    frame = frame[np.isfinite(frame["Horas"])]
+    if frame.empty:
+        raise IngestError("No hay filas con tiempo válido.")
+    frame["Horas"] -= frame["Horas"].min()
+
+    bucket = np.floor(frame["Horas"] * SAMPLES_PER_HOUR + 1e-9).astype(int)
+    if bucket.max() + 1 > MAX_POINTS:
+        raise IngestError(f"El archivo cubre demasiado tiempo (máximo {MAX_POINTS // SAMPLES_PER_HOUR} h). Cárgalo por tramos.")
+    grid = frame.drop(columns="Horas").groupby(bucket).mean().reindex(range(int(bucket.max()) + 1))
+    grid.insert(0, "Horas", grid.index.to_numpy() / SAMPLES_PER_HOUR)
+    grid = grid.reset_index(drop=True)
+    if grid["Horas"].iloc[-1] < MIN_HOURS:
+        raise IngestError(f"Se necesitan al menos {MIN_HOURS:g} h de datos: las primeras {LEARN_H:g} h se usan para aprender el perfil normal.")
+    return grid
+
+
+def analyze_readings(grid: pd.DataFrame, asset_name: str, intervention_threshold: float):
+    """Mismo resultado que `simulate_frames` (telemetría, alertas, índice de intervención) a partir de lecturas reales."""
+    asset = ASSETS[asset_name]
+    hours = grid["Horas"].to_numpy()
+    observed = {v: grid[v].to_numpy(dtype=float) for v in asset["variables"]}
+    statuses, alerts = classify_readings(hours, observed, asset, full=True)
+
+    learn_samples = int(LEARN_H * SAMPLES_PER_HOUR)
+    baseline = learned_baseline(observed, asset, 0, learn_samples)
+    estimate = condition_index(observed, asset, baseline)
+    above = np.nan_to_num(estimate, nan=0.0) >= intervention_threshold
+    above[:learn_samples] = False                    # mientras aprende el perfil normal no propone intervenir
+    index = persistent_hit(above)
+    if index is not None:
+        alerts.append({
+            "Hora": round(float(hours[index]), 2), "Variable": "Mantenimiento", "Lectura": 0.0, "Umbral": 0.0,
+            "Nivel": NIVEL_INTERVENCION_PROPUESTA,
+        })
+    index_pct = estimate * 100
+    columns = {"Hora simulada": hours, "Degradación": np.clip(np.nan_to_num(index_pct, nan=0.0), 0, 100)}
+    columns.update(observed)
+    columns["Estado"] = statuses
+    columns["Índice de condición estimado (%)"] = index_pct
+    columns["Perfil normal"] = np.full(len(hours), "Aprendido (inicial)", dtype=object)
+    df = pd.DataFrame(columns)
+    alerts_df = pd.DataFrame(alerts).sort_values("Hora") if alerts else pd.DataFrame()
+    return df, alerts_df, index
+
+
+def template_csv(asset_name: str) -> bytes:
+    """CSV de ejemplo con el formato esperado (48 h con desgaste progresivo, una lectura cada 5 min)."""
+    t = run_simulation(SimConfig(asset_name, "Desgaste progresivo", 48, 7), "Reactivo", full=False)
+    frame = pd.DataFrame({"timestamp": pd.date_range("2026-01-01", periods=len(t.hours), freq="5min")})
+    for variable, values in t.observed.items():
+        frame[variable] = np.round(values, 3)
+    return frame.to_csv(index=False).encode("utf-8")
+
+
+# ===========================================================================
+# AUTH
+# ===========================================================================
+
+ITERATIONS = 200_000
+ROLES = {
+    "operador": {"ver"},
+    "jefe_mantenimiento": {"ver", "decidir"},
+    "admin": {"ver", "decidir", "configurar"},
+}
+ROLE_LABEL = {"operador": "Operador", "jefe_mantenimiento": "Jefe de Mantenimiento", "admin": "Administrador"}
+
+
+def hash_password(password: str, salt: bytes = None) -> dict:
+    salt = salt or os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, ITERATIONS)
+    return {"salt": salt.hex(), "hash": digest.hex(), "iterations": ITERATIONS}
+
+
+def verify_password(password: str, record: dict) -> bool:
+    salt = bytes.fromhex(record["salt"])
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(record.get("iterations", ITERATIONS)))
+    return hmac.compare_digest(digest.hex(), record["hash"])
+
+
+def load_users(path: Path) -> dict:
+    """Usuarios del archivo JSON. Sin archivo => {} (modo demostración sin autenticación)."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    users = data.get("users", {})
+    for name, record in users.items():
+        if record.get("role") not in ROLES:
+            raise ValueError(f"Usuario {name}: rol inválido {record.get('role')!r}. Opciones: {', '.join(ROLES)}")
+    return users
+
+
+def authenticate(users: dict, username: str, password: str):
+    """Devuelve {'username', 'name', 'role'} si las credenciales son correctas; None si no."""
+    record = users.get(username.strip())
+    # Se calcula el hash aun si el usuario no existe, para no revelar por tiempo qué usuarios existen.
+    dummy = {"salt": "00" * 16, "hash": "00" * 32, "iterations": ITERATIONS}
+    ok = verify_password(password, record if record else dummy)
+    if record and ok:
+        return {"username": username.strip(), "name": record.get("name", username.strip()), "role": record["role"]}
+    return None
+
+
+def can(user: dict, permission: str) -> bool:
+    return permission in ROLES.get(user["role"], set())
+
+
+DEMO_USER = {"username": "demo", "name": "Modo demostración", "role": "admin"}
+
+
+# ===========================================================================
+# STORAGE
+# ===========================================================================
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    source TEXT NOT NULL,
+    asset TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    hour REAL,
+    variable TEXT,
+    level TEXT,
+    detail TEXT,
+    ref TEXT UNIQUE
+);
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    ot_id TEXT NOT NULL,
+    asset TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    username TEXT NOT NULL,
+    source TEXT NOT NULL,
+    note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_decisions_ot ON decisions (ot_id, id);
+"""
+VALID_DECISIONS = ("Aprobar", "Rechazar")
+
+
+def _now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+@contextmanager
+def connect(db_path: Path):
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        conn.executescript(SCHEMA)
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def log_event(db_path, source, asset, event_type, hour=None, variable=None, level=None, detail=None, ref=None) -> bool:
+    """Registra un evento. Si `ref` ya existe no duplica y devuelve False (sirve para notificar una sola vez)."""
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO events (ts, source, asset, event_type, hour, variable, level, detail, ref) VALUES (?,?,?,?,?,?,?,?,?)",
+            (_now(), source, asset, event_type, hour, variable, level, detail, ref),
+        )
+        return cur.rowcount == 1
+
+
+def record_decision(db_path, ot_id, asset, decision, username, source, note="") -> None:
+    if decision not in VALID_DECISIONS:
+        raise ValueError(f"Decisión inválida: {decision!r}")
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO decisions (ts, ot_id, asset, decision, username, source, note) VALUES (?,?,?,?,?,?,?)",
+            (_now(), ot_id, asset, decision, username, source, note),
+        )
+
+
+def last_decision(db_path, ot_id):
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT ts, decision, username FROM decisions WHERE ot_id = ? ORDER BY id DESC LIMIT 1", (ot_id,)
+        ).fetchone()
+    return {"ts": row[0], "decision": row[1], "username": row[2]} if row else None
+
+
+def list_events(db_path, limit=500) -> pd.DataFrame:
+    with connect(db_path) as conn:
+        return pd.read_sql_query(
+            "SELECT ts AS Fecha, source AS Fuente, asset AS Equipo, event_type AS Evento, hour AS Hora, variable AS Variable, level AS Nivel, detail AS Detalle "
+            "FROM events ORDER BY id DESC LIMIT ?", conn, params=(int(limit),))
+
+
+def list_decisions(db_path, limit=500) -> pd.DataFrame:
+    with connect(db_path) as conn:
+        return pd.read_sql_query(
+            "SELECT ts AS Fecha, ot_id AS Orden, asset AS Equipo, decision AS Decisión, username AS Usuario, source AS Fuente, note AS Nota "
+            "FROM decisions ORDER BY id DESC LIMIT ?", conn, params=(int(limit),))
+
+
+# ===========================================================================
+# NOTIFY
+# ===========================================================================
+
+_log = get_logger()
+
+
+def channels_configured() -> dict:
+    return {
+        "correo": bool(os.environ.get("GEMELO_SMTP_HOST") and os.environ.get("GEMELO_MAIL_TO")),
+        "webhook": bool(os.environ.get("GEMELO_WEBHOOK_URL")),
+    }
+
+
+def _send_mail(subject: str, body: str) -> None:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = os.environ.get("GEMELO_MAIL_FROM", os.environ.get("GEMELO_SMTP_USER", "gemelo@localhost"))
+    msg["To"] = [a.strip() for a in os.environ["GEMELO_MAIL_TO"].split(",") if a.strip()]
+    msg.set_content(body)
+    port = int(os.environ.get("GEMELO_SMTP_PORT", "587"))
+    with smtplib.SMTP(os.environ["GEMELO_SMTP_HOST"], port, timeout=15) as server:
+        if os.environ.get("GEMELO_SMTP_TLS", "1") != "0":
+            server.starttls()
+        if os.environ.get("GEMELO_SMTP_USER"):
+            server.login(os.environ["GEMELO_SMTP_USER"], os.environ.get("GEMELO_SMTP_PASSWORD", ""))
+        server.send_message(msg)
+
+
+def _send_webhook(text: str) -> None:
+    url = os.environ["GEMELO_WEBHOOK_URL"]
+    if not url.lower().startswith(("https://", "http://")):
+        raise ValueError("GEMELO_WEBHOOK_URL debe empezar con http:// o https://")
+    request = urllib.request.Request(url, data=json.dumps({"text": text}).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, timeout=10):  # noqa: S310  (esquema validado arriba)
+        pass
+
+
+def notify(subject: str, body: str) -> list:
+    """Envía por los canales configurados. Devuelve los que funcionaron; los errores se registran, no se propagan."""
+    sent = []
+    configured = channels_configured()
+    if configured["correo"]:
+        try:
+            _send_mail(subject, body)
+            sent.append("correo")
+        except Exception:  # noqa: BLE001  (la caída de un canal no debe tumbar la aplicación)
+            _log.exception("Fallo al enviar el correo de notificación")
+    if configured["webhook"]:
+        try:
+            _send_webhook(f"{subject}\n{body}")
+            sent.append("webhook")
+        except Exception:  # noqa: BLE001
+            _log.exception("Fallo al enviar el webhook de notificación")
+    return sent
+
+
+# ===========================================================================
+# EVENTS
+# ===========================================================================
+
+_log = get_logger()
+
+
+def data_fingerprint(csv_bytes: bytes) -> str:
+    return hashlib.sha1(csv_bytes).hexdigest()[:8]
+
+
+def register_proposal(asset_name, data_id, df, alerts, intervention_index) -> bool:
+    """Guarda en el historial la intervención propuesta y avisa una sola vez (por equipo y archivo de datos)."""
+    if intervention_index is None:
+        return False
+    hour = float(df.iloc[intervention_index]["Hora simulada"])
+    ref = f"{asset_name}|{data_id}|{intervention_index}"
+    variable = _trigger_variable(alerts)
+    detail = f"Intervención propuesta a las {hour:.2f} h del archivo de datos {data_id}."
+    is_new = log_event(DB_PATH, "datos reales", asset_name, "Intervención propuesta", hour, variable, "Intervención propuesta", detail, ref)
+    if is_new:
+        sent = notify(f"Gemelo digital: intervención propuesta en {asset_name}", detail + " Revisa la vista Alertas para aprobar o rechazar la orden.")
+        _log.info("Intervención propuesta en %s (hora %.2f). Notificada por: %s", asset_name, hour, ", ".join(sent) or "ningún canal configurado")
+    return is_new
+
+
+def _trigger_variable(alerts):
+    if alerts is None or alerts.empty:
+        return None
+    first = alerts[alerts["Variable"] != "Mantenimiento"]
+    return str(first.iloc[0]["Variable"]) if not first.empty else None
+
+
+# ===========================================================================
 # READINGS
 # ===========================================================================
 
@@ -733,16 +1247,18 @@ def verdict(ok):
 # CARDS
 # ===========================================================================
 
-def status_card(asset_name, status, health, hour):
+def status_card(asset_name, status, health, hour, live=False):
     css_status = {"Normal": "normal", "Advertencia": "warning", "Crítico": "critical"}[status]
     label = {"Normal": "OPERACIÓN NORMAL", "Advertencia": "REQUIERE ATENCIÓN", "Crítico": "RIESGO DE FALLA"}[status]
     asset = ASSETS[asset_name]
+    twin = "Gemelo digital" if live else "Gemelo simulado"
+    health_word = "estimado" if live else "simulado"
     st.markdown(
         f'<div class="status-card status-{css_status}">'
         f'<div class="machine-name">{asset_name} · {asset["code"]}</div>'
-        f'<div class="machine-meta">Área de {asset["area"]} · Gemelo simulado · hora {hour:.2f}</div>'
+        f'<div class="machine-meta">Área de {asset["area"]} · {twin} · hora {hour:.2f}</div>'
         f'<span class="status-pill pill-{css_status}">{label}</span>'
-        f'<div class="small-muted" style="margin-top:12px">Índice de salud simulado: '
+        f'<div class="small-muted" style="margin-top:12px">Índice de salud {health_word}: '
         f'<b style="color:#f8fafc">{health:.1f}%</b></div></div>',
         unsafe_allow_html=True,
     )
@@ -810,7 +1326,7 @@ def timeline_figure(df_re, df_pr, alerts_re, alerts_pr, idx_pr, hour):
     def first_warning(alerts):
         if alerts is None or alerts.empty:
             return None
-        rows = alerts[alerts["Nivel"] != "Intervención ejecutada"]
+        rows = alerts[~alerts["Nivel"].map(is_intervention)]
         return float(rows.iloc[0]["Hora"]) if len(rows) else None
 
     for label, alerts in (("Reactiva", alerts_re), ("Predictiva", alerts_pr)):
@@ -1148,6 +1664,12 @@ def threshold_tradeoff(sim: SimConfig, min_lead_h: float, n: int = 60) -> pd.Dat
     return pd.DataFrame(rows)
 
 
+@st.cache_data(show_spinner=False, max_entries=8)
+def analyze_csv(csv_bytes: bytes, asset_name: str, intervention_threshold: float, thresholds_id: str):
+    """Interpreta y analiza un CSV de lecturas reales (el resultado se reutiliza mientras no cambie nada)."""
+    return analyze_readings(parse_csv(csv_bytes, asset_name), asset_name, intervention_threshold)
+
+
 # ===========================================================================
 # SIDEBAR
 # ===========================================================================
@@ -1171,6 +1693,8 @@ class Controls:
     failure_mode: str
     compensate_load: bool
     detection: str
+    data_source: str = "Simulación"
+    csv_bytes: Optional[bytes] = None
 
     @property
     def missing_rate(self) -> float:
@@ -1200,13 +1724,22 @@ def render_sidebar() -> Controls:
     init_state()
     with st.sidebar:
         st.markdown("## ⚙️ Configuración")
+        data_source = st.radio("Fuente de datos", DATA_SOURCES, horizontal=True, key="data_source",
+                               help="Simulación: señales sintéticas para evaluar el gemelo. Datos reales: lecturas de sensores cargadas desde un CSV.")
         asset_name = st.selectbox("Activo digital", list(ASSETS.keys()), key="asset_name")
+        csv_bytes = None
+        if data_source == DATOS_REALES:
+            upload = st.file_uploader("Lecturas de sensores (CSV)", type=["csv"], key="csv_file")
+            csv_bytes = upload.getvalue() if upload is not None else None
+            st.download_button("⬇ Plantilla de CSV", data=template_csv(asset_name), file_name=f"plantilla_{ASSETS[asset_name]['code'].lower()}.csv",
+                               mime="text/csv", help="Ejemplo con el formato esperado: una columna de tiempo y una por variable.")
+            st.caption("Con datos reales solo se aplican el equipo y el umbral de intervención. Los controles de simulación no tienen efecto.")
         scenario = st.selectbox("Escenario", SCENARIOS, key="scenario")
         policy = st.radio("Política de mantenimiento", ["Reactivo", "Predictivo"], horizontal=True, key="policy")
         duration = st.slider("Duración simulada (horas)", 8, 72, step=4, key="duration")
         seed = st.number_input("Semilla del experimento", min_value=1, max_value=9999, key="seed")
         st.divider()
-        st.markdown("#### Supuestos TO-BE")
+        st.markdown("#### Supuestos de mejora (no medidos)")
         mtbf_gain = st.slider("Incremento proyectado del MTBF (%)", 5.0, 60.0, step=0.1, format="%.1f", key="mtbf_gain")
         mttr_reduction = st.slider("Reducción proyectada del MTTR (%)", 5.0, 60.0, step=0.1, format="%.1f", key="mttr_reduction")
         simulations = st.select_slider("Corridas Monte Carlo", options=[100, 250, 500, 1000, 5000, 10000], key="simulations")
@@ -1253,6 +1786,7 @@ def render_sidebar() -> Controls:
         noise_factor=float(noise_factor), missing_rate_pct=int(missing_rate_pct), intervention_pct=int(intervention_pct),
         position_capture=position_capture, inspection_h=int(inspection_h), load_pct=int(load_pct),
         failure_mode=failure_mode, compensate_load=bool(compensate_load), detection=detection,
+        data_source=data_source, csv_bytes=csv_bytes,
     )
 
 
@@ -1338,7 +1872,9 @@ def render_replica(c):
 # ===========================================================================
 
 def render_indicators(c):
-    (alerts_pr, asset_name, det_availability, det_mtbf, df_pr, df_re, idx_pr, inspection_eff, mc, scenario, seed, simulations) = (c.alerts_pr, c.asset_name, c.det_availability, c.det_mtbf, c.df_pr, c.df_re, c.idx_pr, c.inspection_eff, c.mc, c.scenario, c.seed, c.simulations)
+    (alerts_pr, asset_name, det_availability, det_mtbf, df_pr, df_re, idx_pr, inspection_eff, mc, scenario, seed, simulations) = (c.alerts_pr, c.asset_name, c.det_availability, c.det_mtbf, c.df_pr, c.df_re, c.idx_pr, c.inspection_eff, monte_carlo(c.asset_name, c.mtbf_gain, c.mttr_reduction, c.simulations, c.seed), c.scenario, c.seed, c.simulations)
+    if c.is_real:
+        st.info("Con datos reales, los criterios de detección usan tus lecturas. La simulación Monte Carlo sigue basándose en los supuestos de mejora de la barra lateral, no en mediciones.")
     st.markdown('<div class="section-title">Resultados de la simulación Monte Carlo</div>', unsafe_allow_html=True)
     st.caption(f"Resultado de {simulations} corridas por política. El incremento del MTBF y la reducción del MTTR "
                "son supuestos configurables, no resultados medidos.")
@@ -1369,7 +1905,7 @@ def render_indicators(c):
     predictive = mc[mc["Política"] == "Predictiva"]
     mc_availability = predictive["Disponibilidad (%)"].mean()
     mc_mtbf = predictive["MTBF (h)"].mean()
-    first_alert_row = alerts_pr[alerts_pr["Nivel"] != "Intervención ejecutada"] if not alerts_pr.empty else alerts_pr
+    first_alert_row = alerts_pr[~alerts_pr["Nivel"].map(is_intervention)] if not alerts_pr.empty else alerts_pr
     first_alert_hour = float(first_alert_row.iloc[0]["Hora"]) if len(first_alert_row) else np.nan
     critical_reactive = df_re.index[df_re["Estado"] == "Crítico"].tolist()
     critical_hour_reactive = float(df_re.loc[critical_reactive[0], "Hora simulada"]) if critical_reactive else np.nan
@@ -1529,61 +2065,84 @@ def render_sensitivity(c):
 # VISTA · ALERTS
 # ===========================================================================
 
+_log = get_logger()
+
+
 def render_alerts(c):
-    (alerts, asset, asset_name, df, df_pr, df_re, duration, idx_pr, intervention_index) = (c.alerts, c.asset, c.asset_name, c.df, c.df_pr, c.df_re, c.duration, c.idx_pr, c.intervention_index)
-    st.markdown('<div class="section-title">Registro de eventos predictivos</div>', unsafe_allow_html=True)
+    alerts, asset, asset_name, df, df_pr, df_re = c.alerts, c.asset, c.asset_name, c.df, c.df_pr, c.df_re
+    idx_pr, intervention_index, duration, is_real, user = c.idx_pr, c.intervention_index, c.duration, c.is_real, c.user
+    st.markdown('<div class="section-title">Registro de eventos del gemelo</div>', unsafe_allow_html=True)
     if alerts.empty:
-        st.success("No se detectaron anomalías durante el escenario seleccionado.")
+        st.success("No se detectaron anomalías en el periodo analizado.")
     else:
         st.dataframe(alerts, width="stretch", hide_index=True)
-        first_alert = alerts[alerts["Nivel"] != "Intervención ejecutada"]
+        first_alert = alerts[~alerts["Nivel"].map(is_intervention)]
         if not first_alert.empty:
             alert_hour = float(first_alert.iloc[0]["Hora"])
             critical_rows = df[df["Estado"] == "Crítico"]
             lead_time = max(0.0, float(critical_rows.iloc[0]["Hora simulada"]) - alert_hour) if not critical_rows.empty else duration - alert_hour
-            st.info(f"Tiempo de anticipación simulado: **{lead_time:.2f} horas** desde la primera alerta hasta la condición crítica o el final del escenario.")
-        if intervention_index is not None:
-            st.success(f"El mantenimiento predictivo fue ejecutado virtualmente en la hora {df.iloc[intervention_index]['Hora simulada']:.2f}, evitando que la degradación continuara hasta la falla.")
+            label = "Tiempo de anticipación" if is_real else "Tiempo de anticipación simulado"
+            st.info(f"{label}: **{lead_time:.2f} horas** desde la primera alerta hasta la condición crítica o el final del periodo.")
+        if intervention_index is not None and not is_real:
+            st.success(f"El mantenimiento predictivo fue ejecutado virtualmente en la hora {df.iloc[intervention_index]['Hora simulada']:.2f}, "
+                       "evitando que la degradación continuara hasta la falla.")
 
-    # Nivel 6 de la arquitectura (decisión): orden de trabajo propuesta por el gemelo, que aprueba el jefe de Mantenimiento
-    st.markdown('<div class="section-title">Orden de trabajo propuesta por el gemelo (simulada)</div>', unsafe_allow_html=True)
+    title = "Orden de trabajo propuesta por el gemelo" + ("" if is_real else " (simulada)")
+    st.markdown(f'<div class="section-title">{title}</div>', unsafe_allow_html=True)
     if idx_pr is None:
-        st.info("En este escenario el gemelo no propone ninguna intervención: no se detectó degradación sostenida.")
+        st.info("El gemelo no propone ninguna intervención: no se detectó degradación sostenida.")
+        return
+
+    before = max(idx_pr - 1, 0)
+    deviations = {}
+    for variable, cfg in asset["variables"].items():
+        value = df_pr[variable].iloc[: before + 1].dropna()
+        if value.empty:
+            continue
+        v = float(value.iloc[-1])
+        span = (cfg["critical"] - cfg["base"]) if cfg["direction"] == "high" else (cfg["base"] - cfg["critical"])
+        deviations[variable] = ((v - cfg["base"]) if cfg["direction"] == "high" else (cfg["base"] - v)) / span, v
+    trigger = max(deviations, key=lambda k: deviations[k][0])
+    t_int = float(df_pr["Hora simulada"].iloc[idx_pr])
+    crit_rows = df_re.index[df_re["Estado"] == "Crítico"].tolist()
+    lead = (float(df_re.loc[crit_rows[0], "Hora simulada"]) - t_int) if crit_rows else float("nan")
+    if np.isnan(lead):
+        lead_text = "No se alcanza la condición crítica en el periodo analizado"
+    elif lead < 0:
+        lead_text = "La condición crítica ya se había alcanzado"
     else:
-        before = max(idx_pr - 1, 0)
-        deviations = {}
-        for variable, cfg in asset["variables"].items():
-            value = df_pr[variable].iloc[: before + 1].dropna()
-            if value.empty:
-                continue
-            v = float(value.iloc[-1])
-            span = (cfg["critical"] - cfg["base"]) if cfg["direction"] == "high" else (cfg["base"] - cfg["critical"])
-            deviations[variable] = ((v - cfg["base"]) if cfg["direction"] == "high" else (cfg["base"] - v)) / span, v
-        trigger = max(deviations, key=lambda k: deviations[k][0])
-        t_int = float(df_pr["Hora simulada"].iloc[idx_pr])
-        crit_rows = df_re.index[df_re["Estado"] == "Crítico"].tolist()
-        lead = (float(df_re.loc[crit_rows[0], "Hora simulada"]) - t_int) if crit_rows else float("nan")
-        ot_id = f"OT-SIM-{asset['code']}-{t_int:05.2f}"
-        left_ot, right_ot = st.columns([1.6, 1])
-        with left_ot:
-            order = pd.DataFrame({
-                "Campo": ["Orden", "Equipo", "Variable que la origina", "Lectura / umbral de advertencia", "Hora simulada de la propuesta",
-                          "Aviso antes de la condición crítica", "Ventana sugerida", "Repuestos", "Origen"],
-                "Valor": [ot_id, f"{asset_name} · {asset['code']}", trigger,
-                          f"{value_text(trigger, deviations[trigger][1])} / {asset['variables'][trigger]['warning']}", f"{t_int:.2f} h",
-                          f"{lead:.2f} h" if not np.isnan(lead) else "No se alcanza la condición crítica en el horizonte",
-                          "Próxima pausa de turno", "Por definir por el jefe de Mantenimiento; la reserva se solicita al WMS (Componente 1)",
-                          "Gemelo digital (propuesta consultiva)"],
-            })
-            st.dataframe(order, hide_index=True, width="stretch")
-        with right_ot:
-            decision = st.radio("Decisión del jefe de Mantenimiento", ["Pendiente", "Aprobar", "Rechazar"], key=f"decision_{ot_id}")
-            if decision == "Aprobar":
-                st.success("Orden aprobada: se programa en la pausa de turno y se envía la solicitud de repuestos al WMS (simulado).")
-            elif decision == "Rechazar":
-                st.warning("Orden rechazada: el gemelo mantiene la vigilancia y deja registro de la decisión.")
-            else:
-                st.info("Pendiente de revisión. El gemelo es consultivo: no envía comandos a la máquina.")
+        lead_text = f"{lead:.2f} h"
+    ot_id = f"OT-{asset['code']}-{c.data_id}-{t_int:05.2f}" if is_real else f"OT-SIM-{asset['code']}-{t_int:05.2f}"
+    source = "datos reales" if is_real else "simulación"
+
+    left_ot, right_ot = st.columns([1.6, 1])
+    with left_ot:
+        order = pd.DataFrame({
+            "Campo": ["Orden", "Equipo", "Variable que la origina", "Lectura / umbral de advertencia", "Hora de la propuesta",
+                      "Aviso antes de la condición crítica", "Ventana sugerida", "Repuestos", "Origen"],
+            "Valor": [ot_id, f"{asset_name} · {asset['code']}", trigger,
+                      f"{value_text(trigger, deviations[trigger][1])} / {asset['variables'][trigger]['warning']}", f"{t_int:.2f} h",
+                      lead_text, "Próxima pausa de turno", "Por definir por el jefe de Mantenimiento",
+                      "Gemelo digital (propuesta consultiva)"],
+        })
+        st.dataframe(order, hide_index=True, width="stretch")
+    with right_ot:
+        st.markdown("**Decisión del jefe de Mantenimiento**")
+        previous = last_decision(DB_PATH, ot_id)
+        if previous:
+            icon = "✅" if previous["decision"] == "Aprobar" else "⛔"
+            st.info(f"{icon} {previous['decision']} · {previous['username']} · {previous['ts'].replace('T', ' ')}")
+        else:
+            st.info("Pendiente de revisión. El gemelo es consultivo: no envía comandos a la máquina.")
+        if can(user, "decidir"):
+            choice = st.radio("Nueva decisión", ["Aprobar", "Rechazar"], index=None, horizontal=True, key=f"decision_{ot_id}",
+                              label_visibility="collapsed")
+            if st.button("Registrar decisión", disabled=choice is None, key=f"save_{ot_id}"):
+                record_decision(DB_PATH, ot_id, asset_name, choice, user["username"], source)
+                _log.info("Decisión %s sobre %s registrada por %s", choice, ot_id, user["username"])
+                st.rerun()
+        else:
+            st.caption("Tu rol solo permite consultar. La decisión la registra el jefe de Mantenimiento.")
 
 
 # ===========================================================================
@@ -1591,7 +2150,7 @@ def render_alerts(c):
 # ===========================================================================
 
 def render_tests(c):
-    (asset, completeness, experiments) = (c.asset, c.completeness, c.experiments)
+    (asset, completeness, experiments) = (c.asset, c.completeness, experiment_results(c.sim))
     st.markdown("### Matriz automática de experimentos")
     st.caption("Compara los tres estados de degradación bajo política reactiva y predictiva con la misma configuración de robustez. "
                "Cada experimento usa una semilla distinta (semilla + 17 por experimento).")
@@ -1682,18 +2241,213 @@ def render_methodology(c):
 
 
 # ===========================================================================
+# VISTA · HISTORY
+# ===========================================================================
+
+def render_history(c):
+    st.markdown('<div class="section-title">Historial de decisiones</div>', unsafe_allow_html=True)
+    st.caption("Cada decisión del jefe de Mantenimiento queda guardada con su fecha y usuario, aunque se cierre la aplicación.")
+    decisions = list_decisions(DB_PATH)
+    if decisions.empty:
+        st.info("Aún no hay decisiones registradas. Aparecerán aquí cuando se apruebe o rechace una orden en la vista Alertas.")
+    else:
+        st.dataframe(decisions, width="stretch", hide_index=True)
+        st.download_button("⬇ Descargar decisiones (CSV)", data=decisions.to_csv(index=False).encode("utf-8"),
+                           file_name="decisiones.csv", mime="text/csv")
+
+    st.markdown('<div class="section-title">Intervenciones propuestas con datos reales</div>', unsafe_allow_html=True)
+    events = list_events(DB_PATH)
+    if events.empty:
+        st.info("Aún no hay intervenciones propuestas. Se registran automáticamente al analizar lecturas reales.")
+    else:
+        equipment = st.selectbox("Equipo", ["Todos"] + sorted(events["Equipo"].unique()), key="history_asset")
+        shown = events if equipment == "Todos" else events[events["Equipo"] == equipment]
+        st.dataframe(shown, width="stretch", hide_index=True)
+        st.download_button("⬇ Descargar eventos (CSV)", data=shown.to_csv(index=False).encode("utf-8"),
+                           file_name="eventos.csv", mime="text/csv")
+
+
+# ===========================================================================
+# VISTA · ADMIN
+# ===========================================================================
+
+_log = get_logger()
+
+
+def _thresholds_editor():
+    st.markdown('<div class="section-title">Umbrales por equipo</div>', unsafe_allow_html=True)
+    st.caption("Los valores por defecto son demostrativos: deben calibrarse con la línea base real y las especificaciones del fabricante. "
+               f"Se guardan en `{CONFIG_PATH}` y se aplican de inmediato.")
+    asset_name = st.selectbox("Equipo", list(ASSETS.keys()), key="admin_asset")
+    variables = ASSETS[asset_name]["variables"]
+    table = pd.DataFrame({
+        "Variable": list(variables),
+        "Sentido": ["sube al degradarse" if v["direction"] == "high" else "baja al degradarse" for v in variables.values()],
+        "Valor normal": [v["base"] for v in variables.values()],
+        "Advertencia": [v["warning"] for v in variables.values()],
+        "Crítico": [v["critical"] for v in variables.values()],
+    })
+    edited = st.data_editor(table, hide_index=True, width="stretch", key=f"thr_{asset_name}",
+                            disabled=["Variable", "Sentido", "Valor normal"])
+    left, right = st.columns(2)
+    if left.button("Guardar umbrales", key="thr_save"):
+        errors, new_values = [], {}
+        for _, row in edited.iterrows():
+            spec = variables[row["Variable"]]
+            problems = validate_thresholds(spec["direction"], spec["base"], float(row["Advertencia"]), float(row["Crítico"]))
+            if problems:
+                errors.append(f"{row['Variable']}: {problems[0]}")
+            new_values[row["Variable"]] = {"warning": float(row["Advertencia"]), "critical": float(row["Crítico"])}
+        if errors:
+            st.error("No se guardó:\n\n" + "\n".join(f"- {e}" for e in errors))
+        else:
+            overrides = load_overrides(CONFIG_PATH)
+            overrides[asset_name] = new_values
+            save_overrides(CONFIG_PATH, overrides)
+            st.cache_data.clear()
+            _log.info("Umbrales de %s actualizados", asset_name)
+            st.rerun()
+    if right.button("Restaurar valores de fábrica", key="thr_reset"):
+        overrides = load_overrides(CONFIG_PATH)
+        overrides.pop(asset_name, None)
+        save_overrides(CONFIG_PATH, overrides)
+        st.cache_data.clear()
+        _log.info("Umbrales de %s restaurados", asset_name)
+        st.rerun()
+
+
+def _integrations():
+    st.markdown('<div class="section-title">Notificaciones</div>', unsafe_allow_html=True)
+    channels = channels_configured()
+    st.write(f"Correo: **{'configurado' if channels['correo'] else 'sin configurar'}** · "
+             f"Webhook: **{'configurado' if channels['webhook'] else 'sin configurar'}**")
+    st.caption("Se configuran con variables de entorno (ver README). Se avisa una sola vez por cada intervención propuesta con datos reales.")
+    if st.button("Enviar notificación de prueba", disabled=not any(channels.values()), key="notify_test"):
+        sent = notify("Gemelo digital: prueba de notificación", "Si recibes este mensaje, el canal está bien configurado.")
+        st.success(f"Enviada por: {', '.join(sent)}") if sent else st.error("No se pudo enviar. Revisa el registro de la aplicación.")
+
+
+def _users_and_data():
+    st.markdown('<div class="section-title">Usuarios y datos</div>', unsafe_allow_html=True)
+    users = load_users(USERS_PATH)
+    if users:
+        st.dataframe(pd.DataFrame([{"Usuario": u, "Nombre": r.get("name", u), "Rol": ROLE_LABEL[r["role"]]} for u, r in users.items()]),
+                     hide_index=True, width="stretch")
+    else:
+        st.warning(f"No hay archivo de usuarios (`{USERS_PATH}`): la aplicación funciona en modo demostración, sin inicio de sesión. "
+                   "Para producción, crea usuarios con `python crear_usuario.py`.")
+    st.caption(f"Base de datos: `{DB_PATH}` · {len(list_decisions(DB_PATH))} decisiones · {len(list_events(DB_PATH))} eventos · registros en `{DATA_DIR}`.")
+
+
+def render_admin(c):
+    _thresholds_editor()
+    _integrations()
+    _users_and_data()
+
+
+# ===========================================================================
+# VISTA · ANALYSIS
+# ===========================================================================
+
+def render_analysis(c):
+    if c.is_real:
+        st.info("Este análisis usa el simulador con los controles de la barra lateral; no depende del archivo de datos reales cargado.")
+    tab_sens, tab_tests = st.tabs(["📈 Sensibilidad", "🧪 Pruebas"])
+    with tab_sens:
+        render_sensitivity(c)
+    with tab_tests:
+        render_tests(c)
+
+
+# ===========================================================================
+# VISTA · HELP
+# ===========================================================================
+
+def render_help(c):
+    tab_use, tab_method, tab_impl = st.tabs(["Cómo usar", "Metodología", "Implementación"])
+    with tab_use:
+        st.markdown(
+            "**Operación diaria**\n"
+            "1. En la barra lateral elige el equipo y la fuente de datos (simulación o CSV de lecturas reales).\n"
+            "2. **Telemetría** y **Réplica virtual** muestran el estado del equipo en el instante elegido.\n"
+            "3. **Alertas** muestra las advertencias y la orden de trabajo que propone el gemelo. El jefe de Mantenimiento la aprueba o la rechaza.\n"
+            "4. **Historial** conserva cada decisión con su fecha y usuario.\n"
+            "5. **Indicadores** resume disponibilidad, MTBF y MTTR frente a las metas.\n\n"
+            "**Datos reales:** el CSV necesita una columna de tiempo y una columna por variable del equipo. "
+            "Descarga la plantilla desde la barra lateral. Las primeras 4 horas se usan para aprender el perfil normal del equipo, "
+            "así que deben corresponder a operación sin fallas.\n\n"
+            "**Importante:** el gemelo es consultivo. No envía comandos a la máquina."
+        )
+        st.caption(f"Versión {APP_VERSION}")
+    with tab_method:
+        render_methodology(c)
+    with tab_impl:
+        render_implementation(c)
+
+
+# ===========================================================================
 # APLICACIÓN
 # ===========================================================================
 
-# Orden de VIEWS -> módulo que dibuja cada vista
-RENDERERS = dict(zip(VIEWS, (render_telemetry, render_replica, render_indicators, render_sensitivity,
-                           render_alerts, render_tests, render_implementation, render_methodology)))
+RENDERERS = {
+    V_TELEMETRIA: render_telemetry, V_REPLICA: render_replica, V_ALERTAS: render_alerts, V_HISTORIAL: render_history,
+    V_INDICADORES: render_indicators, V_ANALISIS: render_analysis, V_CONFIG: render_admin, V_AYUDA: render_help,
+}
 # Controles que viven dentro de una vista: se conservan al cambiar de vista (Streamlit descarta
 # el estado de los widgets que no se dibujan en una ejecución).
-VIEW_KEYS = ("p_prog", "min_lead_h")
+VIEW_KEYS = ("p_prog", "min_lead_h", "history_asset", "admin_asset")
+MAX_LOGIN_ATTEMPTS = 5
 
 st.set_page_config(page_title=APP_TITLE, page_icon="⚙️", layout="wide", initial_sidebar_state="expanded")
 inject_css()
+_log = get_logger()
+
+
+# ---------------------------------------------------------------------------
+# Acceso
+# ---------------------------------------------------------------------------
+def current_user() -> dict:
+    """Usuario con sesión iniciada. Sin archivo de usuarios, modo demostración (sin inicio de sesión)."""
+    users = load_users(USERS_PATH)
+    if not users:
+        return DEMO_USER
+    user = st.session_state.get("user")
+    if user:
+        return user
+    _, center, _ = st.columns([1, 1.2, 1])
+    with center:
+        st.markdown(f"## ⚙️ {APP_TITLE}")
+        attempts = st.session_state.get("login_attempts", 0)
+        if attempts >= MAX_LOGIN_ATTEMPTS:
+            st.error("Demasiados intentos fallidos. Cierra y vuelve a abrir la pestaña para intentar de nuevo.")
+            st.stop()
+        with st.form("login"):
+            username = st.text_input("Usuario")
+            password = st.text_input("Contraseña", type="password")
+            submitted = st.form_submit_button("Ingresar", width="stretch")
+        if submitted:
+            found = authenticate(users, username, password)
+            if found:
+                st.session_state["user"] = found
+                st.session_state["login_attempts"] = 0
+                _log.info("Inicio de sesión: %s (%s)", found["username"], found["role"])
+                st.rerun()
+            st.session_state["login_attempts"] = attempts + 1
+            _log.warning("Intento de inicio de sesión fallido para el usuario %r", username)
+            time.sleep(1)
+            st.error("Usuario o contraseña incorrectos.")
+    st.stop()
+
+
+def render_user_box(user: dict, auth_enabled: bool) -> None:
+    with st.sidebar:
+        if auth_enabled:
+            st.caption(f"👤 {user['name']} · {ROLE_LABEL[user['role']]}")
+            if st.button("Cerrar sesión", width="stretch"):
+                st.session_state.pop("user", None)
+                st.rerun()
+        else:
+            st.caption("👤 Modo demostración (sin inicio de sesión)")
 
 
 def keep_view_state() -> None:
@@ -1702,60 +2456,82 @@ def keep_view_state() -> None:
             st.session_state[key] = st.session_state[key]
 
 
-def build_context(ctl) -> SimpleNamespace:
+# ---------------------------------------------------------------------------
+# Datos del análisis
+# ---------------------------------------------------------------------------
+def build_context(ctl, user) -> SimpleNamespace:
     """Calcula una sola vez los resultados que comparten todas las vistas."""
+    is_real = ctl.data_source == DATOS_REALES
     sim = SimConfig(
         asset_name=ctl.asset_name, scenario=ctl.scenario, duration=ctl.duration, seed=ctl.seed,
         noise_factor=ctl.noise_factor, missing_rate=ctl.missing_rate,
         intervention_threshold=ctl.intervention_threshold, detection=ctl.detection,
         load_variability=ctl.load_pct / 100, compensate_load=ctl.compensate_load,
-        inspection_h=ctl.inspection_eff, failure_mode=ctl.failure_mode,
+        inspection_h=ctl.inspection_eff, failure_mode=ctl.failure_mode, thresholds_id=fingerprint(ASSETS),
     )
-    df_re, alerts_re, idx_re = simulate_telemetry(sim, "Reactivo")
-    df_pr, alerts_pr, idx_pr = simulate_telemetry(sim, "Predictivo")
-    df, alerts, intervention_index = (df_re, alerts_re, idx_re) if ctl.policy == "Reactivo" else (df_pr, alerts_pr, idx_pr)
+    data_id, duration, inspection_eff = "", float(ctl.duration), ctl.inspection_eff
+    if is_real:
+        if ctl.csv_bytes is None:
+            st.info("Carga un CSV de lecturas en la barra lateral para analizar datos reales. Puedes descargar una plantilla con el formato esperado.")
+            st.stop()
+        try:
+            df, alerts_df, idx = analyze_csv(ctl.csv_bytes, ctl.asset_name, ctl.intervention_threshold, sim.thresholds_id)
+        except IngestError as error:
+            st.error(str(error))
+            st.stop()
+        data_id = data_fingerprint(ctl.csv_bytes)
+        df_re = df_pr = df
+        alerts_re = alerts_pr = alerts_df
+        idx_re, idx_pr = None, idx
+        intervention_index = idx
+        duration, inspection_eff = float(df["Hora simulada"].iloc[-1]), 0.0
+        register_proposal(ctl.asset_name, data_id, df, alerts_df, idx)
+    else:
+        df_re, alerts_re, idx_re = simulate_telemetry(sim, "Reactivo")
+        df_pr, alerts_pr, idx_pr = simulate_telemetry(sim, "Predictivo")
+        df, alerts_df, intervention_index = (df_re, alerts_re, idx_re) if ctl.policy == "Reactivo" else (df_pr, alerts_pr, idx_pr)
 
     asset = ASSETS[ctl.asset_name]
     operating, base_mtbf, base_mttr, base_availability = base_metrics(asset)
     det_mtbf = base_mtbf * (1 + ctl.mtbf_gain / 100)
     det_mttr = base_mttr * (1 - ctl.mttr_reduction / 100)
     det_availability = availability_pct(det_mtbf, det_mttr)
-    projected_mtbf, projected_mttr = (det_mtbf, det_mttr) if ctl.policy == "Predictivo" else (base_mtbf, base_mttr)
+    projected_mtbf, projected_mttr = (det_mtbf, det_mttr) if (ctl.policy == "Predictivo" or is_real) else (base_mtbf, base_mttr)
     projected_availability = availability_pct(projected_mtbf, projected_mttr)
     projected_downtime = asset["scheduled_hours"] * (1 - projected_availability / 100)
 
     return SimpleNamespace(
-        sim=sim, asset=asset, df_re=df_re, alerts_re=alerts_re, idx_re=idx_re, df_pr=df_pr, alerts_pr=alerts_pr,
-        idx_pr=idx_pr, df=df, alerts=alerts, intervention_index=intervention_index,
-        mc=monte_carlo(ctl.asset_name, ctl.mtbf_gain, ctl.mttr_reduction, ctl.simulations, ctl.seed),
-        experiments=experiment_results(sim),
+        user=user, is_real=is_real, data_id=data_id, sim=sim, asset=asset,
+        df_re=df_re, alerts_re=alerts_re, idx_re=idx_re, df_pr=df_pr, alerts_pr=alerts_pr, idx_pr=idx_pr,
+        df=df, alerts=alerts_df, intervention_index=intervention_index,
         operating=operating, base_mtbf=base_mtbf, base_mttr=base_mttr, base_availability=base_availability,
         det_mtbf=det_mtbf, det_mttr=det_mttr, det_availability=det_availability,
         projected_mtbf=projected_mtbf, projected_mttr=projected_mttr, projected_availability=projected_availability,
         projected_downtime=projected_downtime,
         avoided_downtime=max(0.0, asset["downtime_hours"] - projected_downtime),
-        completeness=data_quality(df, ctl.asset_name, ctl.inspection_eff > 0),
-        inspection_eff=ctl.inspection_eff,
-        # parámetros de los controles que usan las vistas
-        asset_name=ctl.asset_name, scenario=ctl.scenario, policy=ctl.policy, duration=ctl.duration, seed=ctl.seed,
-        mtbf_gain=ctl.mtbf_gain, mttr_reduction=ctl.mttr_reduction, simulations=ctl.simulations,
-        detection=ctl.detection,
+        completeness=data_quality(df, ctl.asset_name, inspection_eff > 0), inspection_eff=inspection_eff,
+        asset_name=ctl.asset_name, scenario=ctl.scenario, policy=ctl.policy, duration=duration, seed=ctl.seed,
+        mtbf_gain=ctl.mtbf_gain, mttr_reduction=ctl.mttr_reduction, simulations=ctl.simulations, detection=ctl.detection,
     )
 
 
+# ---------------------------------------------------------------------------
+# Encabezado
+# ---------------------------------------------------------------------------
 def render_header(c) -> None:
+    subtitle = "con lecturas reales de sensores" if c.is_real else "con telemetría simulada"
     st.markdown(
-        """
+        f"""
         <div class="hero">
           <div class="eyebrow">Industria 4.0 · TPM · Gemelos digitales consultivos</div>
           <h1>Gemelos digitales de mantenimiento</h1>
-          <p>Un gemelo digital por equipo (CNC plasma y torno), con telemetría simulada, detección de degradación y evaluación de la política de mantenimiento.</p>
+          <p>Un gemelo digital por equipo (CNC plasma y torno), {subtitle}, detección de degradación y evaluación de la política de mantenimiento.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
     hour_selected = st.slider(
-        "Instante de la simulación (hora simulada)", 0.0, float(c.duration), float(c.duration),
+        "Instante a revisar (horas desde el inicio)", 0.0, float(c.duration), float(c.duration),
         step=1 / SAMPLES_PER_HOUR, format="%.2f h",
     )
     c.moment = int(min(max(round(hour_selected * SAMPLES_PER_HOUR), 0), len(c.df) - 1))
@@ -1763,22 +2539,25 @@ def render_header(c) -> None:
     st.plotly_chart(timeline_figure(c.df_re, c.df_pr, c.alerts_re, c.alerts_pr, c.idx_pr, c.hour_now),
                     width="stretch", config=PLOTLY_CONFIG_BARE)
     st.caption("Franja de estado por política: verde = normal, amarillo = advertencia, rojo = crítico. ★ primera alerta; "
-               "◆ intervención propuesta por el gemelo. Cambia al mover el escenario, el ruido, la pérdida de datos, el umbral o el método de detección.")
+               "◆ intervención propuesta por el gemelo."
+               + (" Con datos reales ambas franjas muestran las mismas lecturas." if c.is_real else
+                  " Cambia al mover el escenario, el ruido, la pérdida de datos, el umbral o el método de detección."))
 
     c.status_now = str(c.df.iloc[c.moment]["Estado"])
     c.health_now = float(min(100.0, max(0.0, 100 - float(c.df.iloc[c.moment]["Degradación"]))))
+    assumption = "Calculado con los supuestos de mejora de la barra lateral; no es una medición."
     col_status, col_health, col_risk, col_data = st.columns([1.6, 1, 1, 1])
     with col_status:
-        status_card(c.asset_name, c.status_now, c.health_now, c.hour_now)
+        status_card(c.asset_name, c.status_now, c.health_now, c.hour_now, live=c.is_real)
     with col_health:
-        st.metric("Disponibilidad proyectada", f"{c.projected_availability:.2f}%", f"{c.projected_availability - c.base_availability:+.2f} pp")
-        st.metric("MTBF proyectado", f"{c.projected_mtbf:.2f} h", f"{c.projected_mtbf - c.base_mtbf:+.2f} h")
+        st.metric("Disponibilidad proyectada", f"{c.projected_availability:.2f}%", f"{c.projected_availability - c.base_availability:+.2f} pp", help=assumption)
+        st.metric("MTBF proyectado", f"{c.projected_mtbf:.2f} h", f"{c.projected_mtbf - c.base_mtbf:+.2f} h", help=assumption)
     with col_risk:
-        st.metric("MTTR proyectado", f"{c.projected_mttr:.2f} h", f"{c.projected_mttr - c.base_mttr:+.2f} h", delta_color="inverse")
-        st.metric("Parada potencial evitada", f"{c.avoided_downtime:.2f} h", "Periodo diagnóstico", delta_color="off")
+        st.metric("MTTR proyectado", f"{c.projected_mttr:.2f} h", f"{c.projected_mttr - c.base_mttr:+.2f} h", delta_color="inverse", help=assumption)
+        st.metric("Parada potencial evitada", f"{c.avoided_downtime:.2f} h", "Periodo diagnóstico", delta_color="off", help=assumption)
     with col_data:
         st.metric("Calidad de datos", f"{c.completeness:.2f}%", f"Meta ≥ {META_CALIDAD_DATOS:.0f}%", delta_color="off")
-        st.metric("Registros simulados", f"{len(c.df):,}", "Cada 5 min", delta_color="off")
+        st.metric("Registros" + ("" if c.is_real else " simulados"), f"{len(c.df):,}", "Cada 5 min", delta_color="off")
 
     # lecturas en el instante elegido (última lectura válida si el dato se perdió)
     c.readings = {v: last_valid(c.df[v], c.moment) for v in c.asset["variables"]}
@@ -1788,7 +2567,7 @@ def render_config_download(ctl) -> None:
     export = {
         "version_app": APP_VERSION,
         "generado": datetime.now().isoformat(timespec="seconds"),
-        "activo": ctl.asset_name, "escenario": ctl.scenario, "politica": ctl.policy,
+        "fuente_datos": ctl.data_source, "activo": ctl.asset_name, "escenario": ctl.scenario, "politica": ctl.policy,
         "duracion_h": ctl.duration, "semilla": ctl.seed,
         "incremento_mtbf_pct": ctl.mtbf_gain, "reduccion_mttr_pct": ctl.mttr_reduction,
         "corridas_monte_carlo": ctl.simulations, "ruido_sensor": ctl.noise_factor,
@@ -1806,15 +2585,24 @@ def render_config_download(ctl) -> None:
 
 
 def main() -> None:
+    for message in reload_thresholds(ASSETS, ASSETS_FACTORY, CONFIG_PATH):
+        _log.debug("Umbral: %s", message)
+    auth_enabled = bool(load_users(USERS_PATH))
+    user = current_user()
     keep_view_state()
+    render_user_box(user, auth_enabled)
     controls = render_sidebar()
-    ctx = build_context(controls)
+    ctx = build_context(controls, user)
     render_header(ctx)
-    view = st.radio("Vista", VIEWS, horizontal=True, label_visibility="collapsed", key="view")
+
+    views = [v for v in VIEWS if v != V_CONFIG or can(user, "configurar")]
+    if st.session_state.get("view") not in views:
+        st.session_state.pop("view", None)
+    view = st.radio("Vista", views, horizontal=True, label_visibility="collapsed", key="view")
     RENDERERS[view](ctx)       # solo se calcula y dibuja la vista activa
     render_config_download(controls)
     st.markdown("---")
-    st.caption(f"Gemelo digital consultivo · Datos simulados · v{APP_VERSION}")
+    st.caption(f"Gemelo digital consultivo · Fuente: {'datos reales' if ctx.is_real else 'datos simulados'} · v{APP_VERSION}")
 
 
 main()
