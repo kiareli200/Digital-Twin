@@ -1,29 +1,32 @@
 """Gemelo digital consultivo para mantenimiento (TPM) · CNC plasma y torno.
 
-Funciona con señales simuladas (para evaluar el gemelo) o con lecturas reales cargadas desde un CSV.
-Para conectar un gateway (MQTT / OPC UA), basta con volcar sus lecturas al formato del CSV de entrada
-o reemplazar `parse_csv` por un lector del gateway: el análisis posterior no cambia.
+Modo simulación (para evaluar el gemelo) o modo real: las lecturas llegan por MQTT desde el gateway de planta
+(topics planta/<equipo>/<variable>[/<punto>], alarmas en planta/<equipo>/alarma), se guardan como serie de tiempo
+y el gemelo aprende el perfil normal de cada equipo antes de proponer intervenciones. No se cargan archivos.
 
 Configuración por variables de entorno (ver README): GEMELO_DATA_DIR, GEMELO_CONFIG, GEMELO_USERS,
-GEMELO_SMTP_*, GEMELO_MAIL_TO, GEMELO_WEBHOOK_URL.
+GEMELO_MQTT_*, GEMELO_SMTP_*, GEMELO_MAIL_TO, GEMELO_WEBHOOK_URL.
 
 Ejecución:  streamlit run app.py
 """
 from contextlib import contextmanager
 import copy
-from dataclasses import dataclass, replace
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime, time as dtime, timedelta
 from email.message import EmailMessage
 import hashlib
 import hmac
-import io
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+import math
 import os
 from pathlib import Path
+import queue
 import smtplib
 import sqlite3
+import ssl
+import threading
 import time
 from types import SimpleNamespace
 from typing import Callable, NamedTuple, Optional
@@ -31,6 +34,7 @@ import unicodedata
 import urllib.request
 
 import numpy as np
+import paho.mqtt.client as mqtt
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -69,7 +73,7 @@ CAPTURA_INSPECCION = "Por inspección TPM"
 
 # Vistas principales (navegación)
 SIMULACION = "Simulación"
-DATOS_REALES = "Datos reales (CSV)"
+DATOS_REALES = "Gateway MQTT (datos reales)"
 DATA_SOURCES = [SIMULACION, DATOS_REALES]
 
 # Vistas principales (navegación). La de configuración solo la ve quien tiene permiso de configurar.
@@ -96,6 +100,7 @@ MODOS_FALLA = {
 # Valores por defecto de los controles
 DEFAULTS = {
     "data_source": SIMULACION,
+    "autorefresh": True,
     "asset_name": "CNC plasma",
     "scenario": "Falla acelerada",
     "policy": "Reactivo",
@@ -194,16 +199,16 @@ ASSETS = {
 # (según la tabla de instrumentación).
 SENSOR_INFO = {
     "CNC plasma": {
-        "Vibración (mm/s RMS)": ("Acelerómetro triaxial IEPE o RS-485, IP67 (1 punto base y 1 de contingencia)", "Accionamiento del eje X (base) y carro del eje Y (contingencia)", "Gateway (MQTT u OPC UA)"),
-        "Temperatura (°C)": ("PT100 clase A con transmisor aislado (2 puntos)", "Servomotores de los ejes X e Y", "Gateway (MQTT u OPC UA)"),
-        "Corriente (A)": ("Transductor de núcleo partido, salida aislada", "Accionamiento principal (verificar si cubre el servomotor del eje Y)", "Gateway (MQTT u OPC UA)"),
+        "Vibración (mm/s RMS)": ("Acelerómetro triaxial IEPE o RS-485, IP67 (1 punto base y 1 de contingencia)", "Accionamiento del eje X (base) y carro del eje Y (contingencia)", "Gateway (MQTT)"),
+        "Temperatura (°C)": ("PT100 clase A con transmisor aislado (2 puntos)", "Servomotores de los ejes X e Y", "Gateway (MQTT)"),
+        "Corriente (A)": ("Transductor de núcleo partido, salida aislada", "Accionamiento principal (verificar si cubre el servomotor del eje Y)", "Gateway (MQTT)"),
         "Error de posición (mm)": ("Inspección del mantenimiento autónomo (TPM); el controlador F2300BT envía pulsos y no recibe realimentación de posición", "Antorcha y ejes", "Registro de inspección TPM"),
     },
     "Torno": {
-        "Vibración (mm/s RMS)": ("Acelerómetro triaxial IEPE o RS-485, IP67 (1 punto base y 1 de contingencia)", "Cabezal (base) y carro longitudinal (contingencia)", "Gateway (MQTT u OPC UA)"),
-        "Temperatura (°C)": ("PT100 clase A con transmisor aislado (2 puntos)", "Cabezal (caja de velocidades) y motor", "Gateway (MQTT u OPC UA)"),
-        "Corriente (A)": ("Transductor de núcleo partido, salida aislada", "Accionamiento principal", "Gateway (MQTT u OPC UA)"),
-        "RPM": ("Sensor inductivo u óptico, salida aislada (interpretar frente a la velocidad que selecciona el operario)", "Husillo", "Gateway (MQTT u OPC UA)"),
+        "Vibración (mm/s RMS)": ("Acelerómetro triaxial IEPE o RS-485, IP67 (1 punto base y 1 de contingencia)", "Cabezal (base) y carro longitudinal (contingencia)", "Gateway (MQTT)"),
+        "Temperatura (°C)": ("PT100 clase A con transmisor aislado (2 puntos)", "Cabezal (caja de velocidades) y motor", "Gateway (MQTT)"),
+        "Corriente (A)": ("Transductor de núcleo partido, salida aislada", "Accionamiento principal", "Gateway (MQTT)"),
+        "RPM": ("Sensor inductivo u óptico, salida aislada (interpretar frente a la velocidad que selecciona el operario)", "Husillo", "Gateway (MQTT)"),
     },
 }
 
@@ -335,6 +340,28 @@ def base_metrics(asset):
 
 def availability_pct(mtbf, mttr):
     return mtbf / (mtbf + mttr) * 100
+
+
+def measured_metrics(programmed_hours, failures):
+    """Indicadores medidos a partir de las paradas registradas.
+
+    failures: lista de duraciones de parada en horas (una por falla).
+    Devuelve dict con fallas, horas de parada, MTBF, MTTR y disponibilidad (None si no hay fallas para MTBF/MTTR).
+    """
+    if programmed_hours <= 0:
+        raise ValueError("Las horas programadas deben ser positivas.")
+    downtime = float(sum(failures))
+    if downtime > programmed_hours:
+        raise ValueError("Las horas de parada superan las horas programadas del periodo.")
+    n = len(failures)
+    operating = programmed_hours - downtime
+    result = {"fallas": n, "horas_parada": downtime, "mtbf": None, "mttr": None,
+              "disponibilidad": operating / programmed_hours * 100}
+    if n:
+        result["mtbf"] = operating / n
+        result["mttr"] = downtime / n
+        result["disponibilidad"] = availability_pct(result["mtbf"], result["mttr"])
+    return result
 
 
 # ===========================================================================
@@ -851,96 +878,61 @@ def seed_means(asset_name, mtbf_gain, mttr_reduction, simulations, n_seeds=100) 
 # INGEST
 # ===========================================================================
 
-TIME_NAMES = {"timestamp", "fecha", "fechahora", "fecha_hora", "hora", "time", "datetime", "tiempo"}
-MAX_POINTS = 20_000                      # ~69 días a una lectura cada 5 min
-MIN_HOURS = LEARN_H + 1                  # el perfil normal se aprende con las primeras horas
+BUCKET_S = 300                      # 5 minutos
+MIN_LEARN_COVERAGE = 0.5            # fracción mínima de lecturas válidas en las horas de aprendizaje
 
 
 class IngestError(ValueError):
-    """El archivo no se puede interpretar; el mensaje está pensado para mostrarse al usuario."""
+    """No hay datos suficientes para analizar; el mensaje está pensado para mostrarse al usuario."""
 
 
-def _normalize(name: str) -> str:
-    text = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode("ascii").lower().strip()
-    return text.split("(")[0].strip().replace("_", " ")
-
-
-def _to_number(series: pd.Series) -> pd.Series:
-    if series.dtype == object:
-        series = series.astype(str).str.strip().str.replace(",", ".", regex=False)
-    return pd.to_numeric(series, errors="coerce")
-
-
-def parse_csv(data: bytes, asset_name: str) -> pd.DataFrame:
-    """Lee el CSV y devuelve una lectura cada 5 min (columnas: 'Horas' y una por variable; vacío = dato perdido)."""
-    if asset_name not in ASSETS:
-        raise IngestError(f"Equipo desconocido: {asset_name}")
-    if not data:
-        raise IngestError("El archivo está vacío.")
-    try:
-        raw = pd.read_csv(io.BytesIO(data), sep=None, engine="python")
-    except Exception as exc:  # noqa: BLE001
-        raise IngestError(f"No se pudo leer el CSV: {exc}") from exc
-    if raw.shape[1] < 2 or raw.empty:
-        raise IngestError("El CSV debe tener una columna de tiempo y una columna por variable.")
-
-    lookup = {_normalize(c): c for c in raw.columns}
-    time_col = next((lookup[k] for k in lookup if k in TIME_NAMES), raw.columns[0])
-
-    columns = {}
-    missing = []
-    for variable in ASSETS[asset_name]["variables"]:
-        source = lookup.get(_normalize(variable))
-        if source is None or source == time_col:
-            missing.append(variable)
+def build_grid(readings: pd.DataFrame, asset_name: str, first_bucket: int, last_bucket: int) -> pd.DataFrame:
+    """Una fila cada 5 min entre los dos instantes. Si una variable tiene varios puntos de medición se toma el peor
+    (el mayor si la degradación sube, el menor si baja). Los huecos quedan vacíos (dato perdido)."""
+    if last_bucket < first_bucket:
+        raise IngestError("Intervalo de tiempo inválido.")
+    asset = ASSETS[asset_name]
+    index = pd.RangeIndex(first_bucket, last_bucket + 1)
+    grid = pd.DataFrame({"bucket": index})
+    for variable, spec in asset["variables"].items():
+        part = readings[readings["variable"] == variable]
+        if part.empty:
+            series = pd.Series(np.nan, index=index)
         else:
-            columns[variable] = source
-    if missing:
-        raise IngestError(
-            f"Faltan columnas para {asset_name}: {', '.join(missing)}. "
-            f"Columnas encontradas: {', '.join(map(str, raw.columns))}."
-        )
-
-    if pd.api.types.is_numeric_dtype(raw[time_col]):
-        hours = raw[time_col].astype(float).to_numpy()
-    else:
-        stamps = pd.to_datetime(raw[time_col], errors="coerce", format="ISO8601")      # 2026-01-31 08:05:00
-        if stamps.isna().mean() > 0.01:
-            stamps = pd.to_datetime(raw[time_col], errors="coerce", dayfirst=True)     # 31/01/2026 08:05
-        if stamps.isna().mean() > 0.01:
-            raise IngestError(f"La columna de tiempo '{time_col}' tiene fechas que no se pueden interpretar.")
-        hours = ((stamps - stamps.min()).dt.total_seconds() / 3600.0).to_numpy()
-
-    frame = pd.DataFrame({"Horas": hours, **{v: _to_number(raw[c]) for v, c in columns.items()}})
-    frame = frame[np.isfinite(frame["Horas"])]
-    if frame.empty:
-        raise IngestError("No hay filas con tiempo válido.")
-    frame["Horas"] -= frame["Horas"].min()
-
-    bucket = np.floor(frame["Horas"] * SAMPLES_PER_HOUR + 1e-9).astype(int)
-    if bucket.max() + 1 > MAX_POINTS:
-        raise IngestError(f"El archivo cubre demasiado tiempo (máximo {MAX_POINTS // SAMPLES_PER_HOUR} h). Cárgalo por tramos.")
-    grid = frame.drop(columns="Horas").groupby(bucket).mean().reindex(range(int(bucket.max()) + 1))
-    grid.insert(0, "Horas", grid.index.to_numpy() / SAMPLES_PER_HOUR)
-    grid = grid.reset_index(drop=True)
-    if grid["Horas"].iloc[-1] < MIN_HOURS:
-        raise IngestError(f"Se necesitan al menos {MIN_HOURS:g} h de datos: las primeras {LEARN_H:g} h se usan para aprender el perfil normal.")
+            worst = part.groupby("bucket")["value"].max() if spec["direction"] == "high" else part.groupby("bucket")["value"].min()
+            series = worst.reindex(index)
+        grid[variable] = series.to_numpy()
+    grid.insert(0, "Horas", (grid["bucket"] - first_bucket) / SAMPLES_PER_HOUR)
     return grid
 
 
-def analyze_readings(grid: pd.DataFrame, asset_name: str, intervention_threshold: float):
-    """Mismo resultado que `simulate_frames` (telemetría, alertas, índice de intervención) a partir de lecturas reales."""
+def learn_profile(grid: pd.DataFrame, asset_name: str):
+    """Perfil normal aprendido con una ventana de lecturas, o None si hay muy pocas lecturas válidas."""
+    asset = ASSETS[asset_name]
+    observed = {v: grid[v].to_numpy(dtype=float) for v in asset["variables"]}
+    for values in observed.values():
+        if np.isfinite(values).mean() < MIN_LEARN_COVERAGE:
+            return None
+    return learned_baseline(observed, asset, 0, len(grid))
+
+
+def analyze_readings(grid: pd.DataFrame, asset_name: str, intervention_threshold: float, baseline=None, learn_until_bucket=0):
+    """Telemetría, alertas e índice de intervención propuesta a partir de lecturas reales.
+
+    baseline: perfil normal aprendido (None mientras el gemelo todavía está aprendiendo: no propone intervenir).
+    learn_until_bucket: no se propone intervenir antes de este instante (fin del aprendizaje).
+    """
     asset = ASSETS[asset_name]
     hours = grid["Horas"].to_numpy()
     observed = {v: grid[v].to_numpy(dtype=float) for v in asset["variables"]}
     statuses, alerts = classify_readings(hours, observed, asset, full=True)
 
-    learn_samples = int(LEARN_H * SAMPLES_PER_HOUR)
-    baseline = learned_baseline(observed, asset, 0, learn_samples)
     estimate = condition_index(observed, asset, baseline)
-    above = np.nan_to_num(estimate, nan=0.0) >= intervention_threshold
-    above[:learn_samples] = False                    # mientras aprende el perfil normal no propone intervenir
-    index = persistent_hit(above)
+    index = None
+    if baseline is not None:
+        above = np.nan_to_num(estimate, nan=0.0) >= intervention_threshold
+        above[grid["bucket"].to_numpy() < learn_until_bucket] = False
+        index = persistent_hit(above)
     if index is not None:
         alerts.append({
             "Hora": round(float(hours[index]), 2), "Variable": "Mantenimiento", "Lectura": 0.0, "Umbral": 0.0,
@@ -951,19 +943,14 @@ def analyze_readings(grid: pd.DataFrame, asset_name: str, intervention_threshold
     columns.update(observed)
     columns["Estado"] = statuses
     columns["Índice de condición estimado (%)"] = index_pct
-    columns["Perfil normal"] = np.full(len(hours), "Aprendido (inicial)", dtype=object)
+    columns["Perfil normal"] = np.full(len(hours), "Aprendido" if baseline is not None else "Aprendiendo", dtype=object)
     df = pd.DataFrame(columns)
     alerts_df = pd.DataFrame(alerts).sort_values("Hora") if alerts else pd.DataFrame()
     return df, alerts_df, index
 
 
-def template_csv(asset_name: str) -> bytes:
-    """CSV de ejemplo con el formato esperado (48 h con desgaste progresivo, una lectura cada 5 min)."""
-    t = run_simulation(SimConfig(asset_name, "Desgaste progresivo", 48, 7), "Reactivo", full=False)
-    frame = pd.DataFrame({"timestamp": pd.date_range("2026-01-01", periods=len(t.hours), freq="5min")})
-    for variable, values in t.observed.items():
-        frame[variable] = np.round(values, 3)
-    return frame.to_csv(index=False).encode("utf-8")
+# Duración del aprendizaje en buckets
+LEARN_BUCKETS = int(LEARN_H * SAMPLES_PER_HOUR)
 
 
 # ===========================================================================
@@ -1050,8 +1037,32 @@ CREATE TABLE IF NOT EXISTS decisions (
     note TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_ot ON decisions (ot_id, id);
+CREATE TABLE IF NOT EXISTS readings (
+    ts REAL NOT NULL,
+    asset TEXT NOT NULL,
+    variable TEXT NOT NULL,
+    point TEXT NOT NULL DEFAULT '',
+    value REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_readings ON readings (asset, ts);
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset TEXT NOT NULL,
+    start_ts REAL NOT NULL,
+    end_ts REAL NOT NULL,
+    note TEXT,
+    username TEXT NOT NULL,
+    created TEXT NOT NULL
+);
 """
 VALID_DECISIONS = ("Aprobar", "Rechazar")
+
+
+BUCKET_S = 300          # las lecturas se agrupan cada 5 minutos para el análisis
 
 
 def _now() -> str:
@@ -1064,6 +1075,7 @@ def connect(db_path: Path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=10)
     try:
+        conn.execute("PRAGMA journal_mode=WAL")      # la escritura del gateway no bloquea las lecturas de la interfaz
         conn.executescript(SCHEMA)
         yield conn
         conn.commit()
@@ -1111,6 +1123,159 @@ def list_decisions(db_path, limit=500) -> pd.DataFrame:
         return pd.read_sql_query(
             "SELECT ts AS Fecha, ot_id AS Orden, asset AS Equipo, decision AS Decisión, username AS Usuario, source AS Fuente, note AS Nota "
             "FROM decisions ORDER BY id DESC LIMIT ?", conn, params=(int(limit),))
+
+
+# ---------------------------------------------------------------------------
+# Lecturas del gateway
+# ---------------------------------------------------------------------------
+def insert_readings(db_path, rows) -> int:
+    """rows: iterable de (ts_epoch, asset, variable, point, value)."""
+    rows = list(rows)
+    if not rows:
+        return 0
+    with connect(db_path) as conn:
+        conn.executemany("INSERT INTO readings (ts, asset, variable, point, value) VALUES (?,?,?,?,?)", rows)
+    return len(rows)
+
+
+def query_readings(db_path, asset, since_ts, until_ts=None) -> pd.DataFrame:
+    """Promedio cada 5 min por variable y punto de medición: columnas bucket, variable, point, value."""
+    until_ts = until_ts if until_ts is not None else time.time() + 3600
+    with connect(db_path) as conn:
+        return pd.read_sql_query(
+            "SELECT CAST(ts / ? AS INTEGER) AS bucket, variable, point, AVG(value) AS value FROM readings "
+            "WHERE asset = ? AND ts >= ? AND ts <= ? GROUP BY bucket, variable, point ORDER BY bucket",
+            conn, params=(BUCKET_S, asset, float(since_ts), float(until_ts)))
+
+
+def reading_span(db_path, asset):
+    """(primer ts, último ts, total) de las lecturas del equipo; (None, None, 0) si no hay."""
+    with connect(db_path) as conn:
+        first, last, total = conn.execute("SELECT MIN(ts), MAX(ts), COUNT(*) FROM readings WHERE asset = ?", (asset,)).fetchone()
+    return first, last, total
+
+
+def purge_readings(db_path, older_than_ts) -> int:
+    with connect(db_path) as conn:
+        return conn.execute("DELETE FROM readings WHERE ts < ?", (float(older_than_ts),)).rowcount
+
+
+# ---------------------------------------------------------------------------
+# Parámetros persistentes (perfil normal aprendido, inicio del aprendizaje)
+# ---------------------------------------------------------------------------
+def get_meta(db_path, key, default=None):
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return json.loads(row[0]) if row else default
+
+
+def set_meta(db_path, key, value) -> None:
+    with connect(db_path) as conn:
+        conn.execute("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                     (key, json.dumps(value)))
+
+
+def delete_meta(db_path, key) -> None:
+    with connect(db_path) as conn:
+        conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+
+
+def recent_event(db_path, asset, event_type, within_hours) -> bool:
+    """¿Hay un evento de ese tipo para el equipo en las últimas `within_hours` horas?"""
+    limit = datetime.fromtimestamp(time.time() - within_hours * 3600).isoformat(timespec="seconds")
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT 1 FROM events WHERE asset = ? AND event_type = ? AND ts >= ? LIMIT 1",
+                           (asset, event_type, limit)).fetchone()
+    return row is not None
+
+
+# ---------------------------------------------------------------------------
+# Fallas y paradas registradas por Mantenimiento
+# ---------------------------------------------------------------------------
+def add_failure(db_path, asset, start_ts, end_ts, note, username) -> None:
+    if end_ts <= start_ts:
+        raise ValueError("El fin de la parada debe ser posterior a su inicio.")
+    with connect(db_path) as conn:
+        conn.execute("INSERT INTO failures (asset, start_ts, end_ts, note, username, created) VALUES (?,?,?,?,?,?)",
+                     (asset, float(start_ts), float(end_ts), note, username, _now()))
+
+
+def list_failures(db_path, asset=None, since_ts=None, until_ts=None) -> pd.DataFrame:
+    query = "SELECT id, asset, start_ts, end_ts, note, username FROM failures WHERE 1=1"
+    params = []
+    if asset:
+        query += " AND asset = ?"; params.append(asset)
+    if since_ts is not None:
+        query += " AND end_ts >= ?"; params.append(float(since_ts))
+    if until_ts is not None:
+        query += " AND start_ts <= ?"; params.append(float(until_ts))
+    with connect(db_path) as conn:
+        return pd.read_sql_query(query + " ORDER BY start_ts DESC", conn, params=params)
+
+
+# ===========================================================================
+# REALTIME
+# ===========================================================================
+
+ANALYSIS_WINDOW_H = 72      # ventana máxima de análisis
+LEARN_S = LEARN_H * 3600
+
+
+@dataclass
+class LiveResult:
+    df: pd.DataFrame
+    alerts: pd.DataFrame
+    intervention_index: Optional[int]
+    t0: float                       # instante (epoch) de la primera fila
+    last_reading_ts: float
+    learning: bool                  # el perfil normal todavía se está aprendiendo
+    baseline_start: float
+    learn_remaining_h: float = 0.0
+    notes: list = field(default_factory=list)
+
+
+def baseline_key(asset): return f"baseline|{asset}"
+def start_key(asset): return f"baseline_start|{asset}"
+
+
+def restart_learning(db_path, asset, at_ts=None) -> None:
+    """El equipo está en condición normal desde `at_ts` (por defecto, ahora): se vuelve a aprender su perfil normal."""
+    set_meta(db_path, start_key(asset), time.time() if at_ts is None else float(at_ts))
+    delete_meta(db_path, baseline_key(asset))
+
+
+def analyze_asset(db_path, asset_name, intervention_threshold, now=None) -> LiveResult:
+    now = time.time() if now is None else now
+    first, last, total = reading_span(db_path, asset_name)
+    if not total:
+        raise IngestError("Todavía no hay lecturas de este equipo. Revisa la conexión con el gateway (barra lateral).")
+    start = get_meta(db_path, start_key(asset_name), None)
+    if start is None:
+        start = first                                   # primera lectura recibida
+        set_meta(db_path, start_key(asset_name), start)
+    learn_end = start + LEARN_S
+
+    stored = get_meta(db_path, baseline_key(asset_name), None)
+    baseline = stored["values"] if stored and abs(stored["start"] - start) < 1 else None
+    notes = []
+    if baseline is None and last >= learn_end:
+        sample = query_readings(db_path, asset_name, start, learn_end)
+        grid = build_grid(sample, asset_name, int(start // BUCKET_S), int(learn_end // BUCKET_S))
+        baseline = learn_profile(grid, asset_name)
+        if baseline is None:
+            notes.append("Hay muy pocas lecturas en las primeras horas para aprender el perfil normal. Revisa los sensores y reinicia el aprendizaje.")
+        else:
+            set_meta(db_path, baseline_key(asset_name), {"start": start, "values": baseline})
+
+    range_start = max(start, first, now - ANALYSIS_WINDOW_H * 3600)
+    first_bucket, last_bucket = int(range_start // BUCKET_S), int(max(last, range_start) // BUCKET_S)
+    grid = build_grid(query_readings(db_path, asset_name, first_bucket * BUCKET_S, now + 3600), asset_name, first_bucket, last_bucket)
+    df, alerts, idx = analyze_readings(grid, asset_name, intervention_threshold, baseline, int(learn_end // BUCKET_S))
+    return LiveResult(
+        df=df, alerts=alerts, intervention_index=idx, t0=first_bucket * BUCKET_S, last_reading_ts=last,
+        learning=baseline is None, baseline_start=start,
+        learn_remaining_h=max(0.0, (learn_end - last) / 3600) if baseline is None else 0.0, notes=notes,
+    )
 
 
 # ===========================================================================
@@ -1172,28 +1337,245 @@ def notify(subject: str, body: str) -> list:
 
 
 # ===========================================================================
+# GATEWAY
+# ===========================================================================
+
+_log = get_logger()
+FUTURE_TOLERANCE_S = 300
+FLUSH_EVERY_S = 2.0
+FLUSH_BATCH = 500
+ALARM_TOPIC = "alarma"
+
+
+def _slug(name: str) -> str:
+    text = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii").lower()
+    return text.split("(")[0].strip().replace(" ", "_")
+
+
+def topic_index(assets: dict) -> dict:
+    """{(código del equipo en minúsculas, variable normalizada): (nombre del activo, nombre de la variable)}"""
+    return {(spec["code"].lower(), _slug(variable)): (asset, variable)
+            for asset, spec in assets.items() for variable in spec["variables"]}
+
+
+def _parse_ts(value, now: float) -> float:
+    if value is None:
+        return now
+    if isinstance(value, (int, float)):
+        ts = float(value) / 1000.0 if value > 1e11 else float(value)
+    else:
+        ts = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00")).timestamp()   # sin zona: hora local del servidor
+    return now if ts > now + FUTURE_TOLERANCE_S else ts
+
+
+@dataclass
+class Reading:
+    ts: float
+    asset: str
+    variable: str
+    point: str
+    value: float
+
+
+@dataclass
+class Alarm:
+    ts: float
+    asset: str
+    text: str
+
+
+def parse_message(topic: str, payload: bytes, prefix: str, index: dict, codes: dict, now: Optional[float] = None):
+    """Interpreta un mensaje. Devuelve Reading, Alarm o None si el tópico o el contenido no son válidos."""
+    now = time.time() if now is None else now
+    parts = topic.strip("/").split("/")
+    if not parts or parts[0] != prefix or len(parts) not in (3, 4):
+        return None
+    code, name = parts[1].lower(), parts[2].lower()
+    try:
+        text = payload.decode("utf-8").strip()
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = text
+        body = data if isinstance(data, dict) else {"value": data}
+        ts = _parse_ts(body.get("ts", body.get("timestamp")), now)
+        if name == ALARM_TOPIC and len(parts) == 3:
+            asset = codes.get(code)
+            if asset is None:
+                return None
+            message = body.get("message") or body.get("mensaje") or body.get("value") or ""
+            return Alarm(ts, asset, f"{body.get('code', body.get('codigo', ''))} {message}".strip() or "Alarma sin detalle")
+        found = index.get((code, name))
+        if found is None:
+            return None
+        value = float(body.get("value", body.get("valor")))
+        if not math.isfinite(value):
+            return None
+        point = parts[3] if len(parts) == 4 else ""
+        return Reading(ts, found[0], found[1], point, value)
+    except (ValueError, TypeError, AttributeError, UnicodeDecodeError):
+        return None
+
+
+@dataclass(frozen=True)
+class GatewayConfig:
+    host: str = ""
+    port: int = 1883
+    username: str = ""
+    password: str = ""
+    tls: bool = False
+    ca_file: str = ""
+    prefix: str = "planta"
+    client_id: str = "gemelo-digital"
+    retention_days: int = 90
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.host)
+
+    @classmethod
+    def from_env(cls) -> "GatewayConfig":
+        env = os.environ
+        port = int(env.get("GEMELO_MQTT_PORT", "1883"))
+        return cls(
+            host=env.get("GEMELO_MQTT_HOST", "").strip(), port=port,
+            username=env.get("GEMELO_MQTT_USER", ""), password=env.get("GEMELO_MQTT_PASSWORD", ""),
+            tls=env.get("GEMELO_MQTT_TLS", "1" if port == 8883 else "0") == "1", ca_file=env.get("GEMELO_MQTT_CA", ""),
+            prefix=env.get("GEMELO_MQTT_PREFIX", "planta").strip("/"), client_id=env.get("GEMELO_MQTT_CLIENT_ID", "gemelo-digital"),
+            retention_days=int(env.get("GEMELO_RETENTION_DAYS", "90")),
+        )
+
+
+class MqttGateway:
+    """Cliente MQTT en segundo plano: recibe, valida y guarda las lecturas. Se reconecta solo si se cae el broker."""
+
+    def __init__(self, config: GatewayConfig, db_path, assets: dict):
+        self.config, self.db_path = config, db_path
+        self._index = topic_index(assets)
+        self._codes = {spec["code"].lower(): asset for asset, spec in assets.items()}
+        self._queue: "queue.Queue" = queue.Queue()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._client = None
+        self._writer = None
+        self.connected = False
+        self.last_message_ts: Optional[float] = None
+        self.accepted = 0
+        self.rejected = 0
+        self.error = ""
+
+    # --- procesamiento de mensajes (también se usa directamente en las pruebas) ---
+    def handle_message(self, topic: str, payload: bytes, now: Optional[float] = None) -> bool:
+        item = parse_message(topic, payload, self.config.prefix, self._index, self._codes, now)
+        with self._lock:
+            if item is None:
+                self.rejected += 1
+                return False
+            self.accepted += 1
+            self.last_message_ts = time.time()
+        self._queue.put(item)
+        return True
+
+    def flush(self) -> int:
+        """Guarda en la base de datos lo recibido hasta ahora. Devuelve cuántas lecturas escribió."""
+        readings, alarms = [], []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            (readings if isinstance(item, Reading) else alarms).append(item)
+        written = insert_readings(self.db_path, [(r.ts, r.asset, r.variable, r.point, r.value) for r in readings])
+        for alarm in alarms:
+            log_event(self.db_path, "gateway", alarm.asset, "Alarma del controlador", None, None, "Alarma", alarm.text,
+                      ref=f"alarma|{alarm.asset}|{alarm.ts:.0f}|{alarm.text}")
+        return written
+
+    def _write_loop(self):
+        last_purge = 0.0
+        while not self._stop.wait(FLUSH_EVERY_S):
+            try:
+                self.flush()
+                if time.time() - last_purge > 3600:
+                    purge_readings(self.db_path, time.time() - self.config.retention_days * 86400)
+                    last_purge = time.time()
+            except Exception:  # noqa: BLE001  (un error de disco no debe matar la recepción)
+                _log.exception("Error al guardar lecturas del gateway")
+
+    # --- conexión ---
+    def start(self) -> bool:
+        if not self.config.configured:
+            return False
+        c = self.config
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=c.client_id)
+        if c.username:
+            client.username_pw_set(c.username, c.password)
+        if c.tls:
+            client.tls_set(ca_certs=c.ca_file or None, cert_reqs=ssl.CERT_REQUIRED)
+        client.reconnect_delay_set(min_delay=1, max_delay=60)
+        client.on_connect = self._on_connect
+        client.on_disconnect = self._on_disconnect
+        client.on_message = lambda _c, _u, msg: self.handle_message(msg.topic, msg.payload)
+        self._client = client
+        self._writer = threading.Thread(target=self._write_loop, name="gemelo-writer", daemon=True)
+        self._writer.start()
+        client.connect_async(c.host, c.port, keepalive=60)
+        client.loop_start()
+        _log.info("Gateway MQTT: conectando a %s:%s (tópicos %s/#)", c.host, c.port, c.prefix)
+        return True
+
+    def _on_connect(self, client, _userdata, _flags, reason_code, _properties):
+        if not getattr(reason_code, "is_failure", reason_code != 0):
+            self.connected, self.error = True, ""
+            client.subscribe([(f"{self.config.prefix}/+/+", 1), (f"{self.config.prefix}/+/+/+", 1)])
+            _log.info("Gateway MQTT conectado")
+        else:
+            self.connected, self.error = False, str(reason_code)
+            _log.error("Gateway MQTT rechazó la conexión: %s", reason_code)
+
+    def _on_disconnect(self, _client, _userdata, _flags, reason_code, _properties):
+        self.connected = False
+        self.error = str(reason_code)
+        _log.warning("Gateway MQTT desconectado: %s", reason_code)
+
+    def stop(self):
+        self._stop.set()
+        if self._client is not None:
+            self._client.loop_stop()
+            self._client.disconnect()
+        self.flush()
+
+    def status(self) -> dict:
+        with self._lock:
+            return {"configured": self.config.configured, "connected": self.connected, "host": self.config.host,
+                    "prefix": self.config.prefix, "last_message_ts": self.last_message_ts,
+                    "accepted": self.accepted, "rejected": self.rejected, "error": self.error}
+
+
+# ===========================================================================
 # EVENTS
 # ===========================================================================
 
 _log = get_logger()
+EVENT_PROPOSAL = "Intervención propuesta"
+COOLDOWN_H = float(os.environ.get("GEMELO_ALERT_COOLDOWN_H", "12"))   # mientras siga activa, se recuerda cada tantas horas
 
 
-def data_fingerprint(csv_bytes: bytes) -> str:
-    return hashlib.sha1(csv_bytes).hexdigest()[:8]
-
-
-def register_proposal(asset_name, data_id, df, alerts, intervention_index) -> bool:
-    """Guarda en el historial la intervención propuesta y avisa una sola vez (por equipo y archivo de datos)."""
-    if intervention_index is None:
+def register_proposal(asset_name, live) -> bool:
+    """Guarda en el historial la intervención propuesta y avisa. No repite el aviso dentro del periodo de espera."""
+    if live.intervention_index is None:
         return False
-    hour = float(df.iloc[intervention_index]["Hora simulada"])
-    ref = f"{asset_name}|{data_id}|{intervention_index}"
-    variable = _trigger_variable(alerts)
-    detail = f"Intervención propuesta a las {hour:.2f} h del archivo de datos {data_id}."
-    is_new = log_event(DB_PATH, "datos reales", asset_name, "Intervención propuesta", hour, variable, "Intervención propuesta", detail, ref)
+    hour = float(live.df.iloc[live.intervention_index]["Hora simulada"])
+    hit_ts = live.t0 + hour * 3600
+    if recent_event(DB_PATH, asset_name, EVENT_PROPOSAL, COOLDOWN_H):
+        return False
+    when = datetime.fromtimestamp(hit_ts).strftime("%d/%m/%Y %H:%M")
+    detail = f"El gemelo propone intervenir {asset_name}: degradación sostenida desde las {when}."
+    is_new = log_event(DB_PATH, "gateway", asset_name, EVENT_PROPOSAL, hour, _trigger_variable(live.alerts), EVENT_PROPOSAL, detail,
+                       ref=f"{asset_name}|{int(hit_ts)}")
     if is_new:
         sent = notify(f"Gemelo digital: intervención propuesta en {asset_name}", detail + " Revisa la vista Alertas para aprobar o rechazar la orden.")
-        _log.info("Intervención propuesta en %s (hora %.2f). Notificada por: %s", asset_name, hour, ", ".join(sent) or "ningún canal configurado")
+        _log.info("%s Notificada por: %s", detail, ", ".join(sent) or "ningún canal configurado")
     return is_new
 
 
@@ -1664,10 +2046,18 @@ def threshold_tradeoff(sim: SimConfig, min_lead_h: float, n: int = 60) -> pd.Dat
     return pd.DataFrame(rows)
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
-def analyze_csv(csv_bytes: bytes, asset_name: str, intervention_threshold: float, thresholds_id: str):
-    """Interpreta y analiza un CSV de lecturas reales (el resultado se reutiliza mientras no cambie nada)."""
-    return analyze_readings(parse_csv(csv_bytes, asset_name), asset_name, intervention_threshold)
+@st.cache_data(show_spinner=False, ttl=15, max_entries=8)
+def analyze_live(asset_name: str, intervention_threshold: float, thresholds_id: str) -> LiveResult:
+    """Análisis de las lecturas guardadas del gateway. Se reutiliza 15 s; los cambios de umbral lo invalidan."""
+    return analyze_asset(DB_PATH, asset_name, intervention_threshold)
+
+
+@st.cache_resource(show_spinner=False)
+def get_gateway() -> MqttGateway:
+    """Cliente MQTT único del proceso (se crea una vez y sigue recibiendo mientras la aplicación esté en marcha)."""
+    gateway = MqttGateway(GatewayConfig.from_env(), DB_PATH, ASSETS)
+    gateway.start()
+    return gateway
 
 
 # ===========================================================================
@@ -1694,7 +2084,7 @@ class Controls:
     compensate_load: bool
     detection: str
     data_source: str = "Simulación"
-    csv_bytes: Optional[bytes] = None
+    autorefresh: bool = False
 
     @property
     def missing_rate(self) -> float:
@@ -1708,6 +2098,20 @@ class Controls:
     def inspection_eff(self) -> float:
         """Intervalo efectivo de inspección (0 = captura continua)."""
         return float(self.inspection_h) if self.position_capture == CAPTURA_INSPECCION else 0.0
+
+
+def _gateway_status() -> None:
+    """Estado de la conexión con el gateway MQTT."""
+    status = get_gateway().status()
+    if not status["configured"]:
+        st.warning("Gateway sin configurar. Define GEMELO_MQTT_HOST (ver README). Mientras tanto se muestran las lecturas ya guardadas.")
+    elif status["connected"]:
+        ago = "sin lecturas aún" if status["last_message_ts"] is None else f"última lectura hace {max(0, int(time.time() - status['last_message_ts']))} s"
+        st.success(f"🟢 Conectado a {status['host']} · {ago} · {status['accepted']:,} recibidas")
+    else:
+        st.error(f"🔴 Sin conexión con {status['host']}. {status['error']}")
+    if status["rejected"]:
+        st.caption(f"{status['rejected']:,} mensajes descartados (tópico o formato inválido).")
 
 
 def init_state() -> None:
@@ -1725,15 +2129,12 @@ def render_sidebar() -> Controls:
     with st.sidebar:
         st.markdown("## ⚙️ Configuración")
         data_source = st.radio("Fuente de datos", DATA_SOURCES, horizontal=True, key="data_source",
-                               help="Simulación: señales sintéticas para evaluar el gemelo. Datos reales: lecturas de sensores cargadas desde un CSV.")
+                               help="Simulación: señales sintéticas para evaluar el gemelo. Gateway MQTT: lecturas reales de los sensores de la planta.")
         asset_name = st.selectbox("Activo digital", list(ASSETS.keys()), key="asset_name")
-        csv_bytes = None
         if data_source == DATOS_REALES:
-            upload = st.file_uploader("Lecturas de sensores (CSV)", type=["csv"], key="csv_file")
-            csv_bytes = upload.getvalue() if upload is not None else None
-            st.download_button("⬇ Plantilla de CSV", data=template_csv(asset_name), file_name=f"plantilla_{ASSETS[asset_name]['code'].lower()}.csv",
-                               mime="text/csv", help="Ejemplo con el formato esperado: una columna de tiempo y una por variable.")
-            st.caption("Con datos reales solo se aplican el equipo y el umbral de intervención. Los controles de simulación no tienen efecto.")
+            _gateway_status()
+            st.checkbox("Actualizar automáticamente (30 s)", key="autorefresh")
+            st.caption("Con el gateway solo se aplican el equipo y el umbral de intervención. Los demás controles de esta barra son del simulador.")
         scenario = st.selectbox("Escenario", SCENARIOS, key="scenario")
         policy = st.radio("Política de mantenimiento", ["Reactivo", "Predictivo"], horizontal=True, key="policy")
         duration = st.slider("Duración simulada (horas)", 8, 72, step=4, key="duration")
@@ -1786,7 +2187,7 @@ def render_sidebar() -> Controls:
         noise_factor=float(noise_factor), missing_rate_pct=int(missing_rate_pct), intervention_pct=int(intervention_pct),
         position_capture=position_capture, inspection_h=int(inspection_h), load_pct=int(load_pct),
         failure_mode=failure_mode, compensate_load=bool(compensate_load), detection=detection,
-        data_source=data_source, csv_bytes=csv_bytes,
+        data_source=data_source, autorefresh=bool(st.session_state.get("autorefresh", False)),
     )
 
 
@@ -1871,10 +2272,54 @@ def render_replica(c):
 # VISTA · INDICATORS
 # ===========================================================================
 
+def _measured_section(c):
+    """As-Is frente a To-Be con las paradas registradas por Mantenimiento (no con supuestos)."""
+    asset = ASSETS[c.asset_name]
+    st.markdown('<div class="section-title">Indicadores medidos (línea base frente a medición)</div>', unsafe_allow_html=True)
+    today = date.today()
+    col_from, col_to, col_hours = st.columns(3)
+    start = col_from.date_input("Desde", value=today - timedelta(days=30), key="m_from")
+    end = col_to.date_input("Hasta", value=today, key="m_to")
+    programmed = col_hours.number_input("Horas programadas del periodo", min_value=1.0, value=float(asset["scheduled_hours"]), step=10.0, key="m_prog",
+                                        help=f"El diagnóstico usó {asset['scheduled_hours']:.0f} h programadas. Ajusta según el periodo elegido.")
+    if end < start:
+        st.error("La fecha final debe ser posterior a la inicial.")
+        return
+    since = datetime.combine(start, dtime.min).timestamp()
+    until = datetime.combine(end, dtime.max).timestamp()
+    failures = list_failures(DB_PATH, c.asset_name, since, until)
+    if failures.empty:
+        st.info("No hay fallas registradas en el periodo. Mantenimiento las registra en la vista Historial; con ellas se calculan MTBF, MTTR y disponibilidad medidos.")
+        return
+    durations = ((failures["end_ts"] - failures["start_ts"]) / 3600).tolist()
+    try:
+        measured = measured_metrics(programmed, durations)
+    except ValueError as error:
+        st.error(str(error))
+        return
+    _, base_mtbf, base_mttr, base_av = base_metrics(asset)
+
+    def fmt(value, unit):
+        return "—" if value is None else f"{value:.2f} {unit}"
+
+    rows = [
+        ("MTBF", fmt(base_mtbf, "h"), fmt(measured["mtbf"], "h"), f"> {META_MTBF} h",
+         verdict(measured["mtbf"] is not None and measured["mtbf"] > META_MTBF)),
+        ("MTTR", fmt(base_mttr, "h"), fmt(measured["mttr"], "h"), "—", "—"),
+        ("Disponibilidad", fmt(base_av, "%"), fmt(measured["disponibilidad"], "%"), f"≥ {META_DISPONIBILIDAD} %",
+         verdict(measured["disponibilidad"] >= META_DISPONIBILIDAD)),
+        ("Fallas en el periodo", f"{asset['failures']}", f"{measured['fallas']}", "—", "—"),
+    ]
+    st.dataframe(pd.DataFrame(rows, columns=["Indicador", "Línea base (As-Is)", "Medido en el periodo", "Meta", "Estado"]), hide_index=True, width="stretch")
+    st.caption("Medido con las paradas registradas por Mantenimiento: MTBF = (horas programadas − horas de parada) / fallas; "
+               "MTTR = horas de parada / fallas. Compáralo con la línea base solo si el periodo y las horas programadas son comparables.")
+
+
 def render_indicators(c):
     (alerts_pr, asset_name, det_availability, det_mtbf, df_pr, df_re, idx_pr, inspection_eff, mc, scenario, seed, simulations) = (c.alerts_pr, c.asset_name, c.det_availability, c.det_mtbf, c.df_pr, c.df_re, c.idx_pr, c.inspection_eff, monte_carlo(c.asset_name, c.mtbf_gain, c.mttr_reduction, c.simulations, c.seed), c.scenario, c.seed, c.simulations)
     if c.is_real:
-        st.info("Con datos reales, los criterios de detección usan tus lecturas. La simulación Monte Carlo sigue basándose en los supuestos de mejora de la barra lateral, no en mediciones.")
+        _measured_section(c)
+        st.info("Más abajo, la simulación Monte Carlo se basa en los supuestos de mejora de la barra lateral, no en mediciones.")
     st.markdown('<div class="section-title">Resultados de la simulación Monte Carlo</div>', unsafe_allow_html=True)
     st.caption(f"Resultado de {simulations} corridas por política. El incremento del MTBF y la reducción del MTTR "
                "son supuestos configurables, no resultados medidos.")
@@ -2112,16 +2557,20 @@ def render_alerts(c):
         lead_text = "La condición crítica ya se había alcanzado"
     else:
         lead_text = f"{lead:.2f} h"
-    ot_id = f"OT-{asset['code']}-{c.data_id}-{t_int:05.2f}" if is_real else f"OT-SIM-{asset['code']}-{t_int:05.2f}"
+    if is_real:
+        when = datetime.fromtimestamp(c.t0 + t_int * 3600)
+        ot_id = f"OT-{asset['code']}-{when:%Y%m%d-%H%M}"
+    else:
+        ot_id = f"OT-SIM-{asset['code']}-{t_int:05.2f}"
     source = "datos reales" if is_real else "simulación"
 
     left_ot, right_ot = st.columns([1.6, 1])
     with left_ot:
         order = pd.DataFrame({
-            "Campo": ["Orden", "Equipo", "Variable que la origina", "Lectura / umbral de advertencia", "Hora de la propuesta",
+            "Campo": ["Orden", "Equipo", "Variable que la origina", "Lectura / umbral de advertencia", "Hora de la propuesta" if not is_real else "Fecha y hora de la propuesta",
                       "Aviso antes de la condición crítica", "Ventana sugerida", "Repuestos", "Origen"],
             "Valor": [ot_id, f"{asset_name} · {asset['code']}", trigger,
-                      f"{value_text(trigger, deviations[trigger][1])} / {asset['variables'][trigger]['warning']}", f"{t_int:.2f} h",
+                      f"{value_text(trigger, deviations[trigger][1])} / {asset['variables'][trigger]['warning']}", f"{t_int:.2f} h" if not is_real else when.strftime("%d/%m/%Y %H:%M"),
                       lead_text, "Próxima pausa de turno", "Por definir por el jefe de Mantenimiento",
                       "Gemelo digital (propuesta consultiva)"],
         })
@@ -2143,6 +2592,14 @@ def render_alerts(c):
                 st.rerun()
         else:
             st.caption("Tu rol solo permite consultar. La decisión la registra el jefe de Mantenimiento.")
+        if is_real and previous and previous["decision"] == "Aprobar" and can(user, "decidir"):
+            st.caption("Cuando el mantenimiento esté hecho, regístralo: el gemelo vuelve a aprender el perfil normal del equipo.")
+            if st.button("Registrar mantenimiento ejecutado", key=f"done_{ot_id}"):
+                restart_learning(DB_PATH, asset_name)
+                log_event(DB_PATH, "gateway", asset_name, "Mantenimiento ejecutado", None, None, "Mantenimiento", f"Orden {ot_id} ejecutada. Registrado por {user['username']}.")
+                st.cache_data.clear()
+                _log.info("Mantenimiento ejecutado en %s (%s) registrado por %s", asset_name, ot_id, user["username"])
+                st.rerun()
 
 
 # ===========================================================================
@@ -2176,14 +2633,14 @@ def render_implementation(c):
     st.markdown(
         """
         La plataforma ya contiene la lógica del gemelo: umbrales, detección, política de mantenimiento y decisión.
-        Al implementar la propuesta, el generador de señales se reemplaza por una entrada MQTT, OPC UA o CSV proveniente
-        del gateway industrial; la interfaz y las reglas no cambian.
+        Al implementar la propuesta, el generador de señales se reemplaza por las lecturas que el gateway industrial publica por MQTT;
+        la interfaz y las reglas no cambian.
 
         | Capa | CNC plasma | Torno | Requisito común |
         |---|---|---|---|
         | Sensores | Vibración, PT100, corriente; error de posición por inspección TPM | Vibración, PT100, corriente y RPM | Montaje trazable y calibración |
         | Adquisición | DAQ IEPE + módulo industrial | DAQ IEPE + módulo industrial | Gabinete IP65 y fuente 24 VDC |
-        | Comunicación | MQTT/OPC UA sobre Ethernet | MQTT/OPC UA sobre Ethernet | Red segmentada, TLS y reloj sincronizado |
+        | Comunicación | MQTT sobre Ethernet | MQTT sobre Ethernet | Red segmentada, TLS y reloj sincronizado |
         | Datos | Series temporales + estado de eje | Series temporales + estado del cabezal | Base de datos y respaldo |
         | Aplicación | Este dashboard | Este dashboard | Confirmación humana de alertas |
         """
@@ -2244,7 +2701,50 @@ def render_methodology(c):
 # VISTA · HISTORY
 # ===========================================================================
 
+_log = get_logger()
+
+
+def _failure_form(user):
+    st.markdown('<div class="section-title">Fallas y paradas</div>', unsafe_allow_html=True)
+    st.caption("Con estos registros se calculan el MTBF, el MTTR y la disponibilidad medidos (vista Indicadores).")
+    if can(user, "decidir"):
+        with st.form("failure_form", clear_on_submit=True):
+            asset = st.selectbox("Equipo", list(ASSETS.keys()))
+            c1, c2, c3, c4 = st.columns(4)
+            start_day = c1.date_input("Inicio de la parada (fecha)", value=date.today())
+            start_time = c2.time_input("Hora de inicio", value=dtime(8, 0))
+            end_day = c3.date_input("Fin de la parada (fecha)", value=date.today())
+            end_time = c4.time_input("Hora de fin", value=dtime(12, 0))
+            note = st.text_input("Causa o descripción")
+            submitted = st.form_submit_button("Registrar parada")
+        if submitted:
+            start_ts = datetime.combine(start_day, start_time).timestamp()
+            end_ts = datetime.combine(end_day, end_time).timestamp()
+            try:
+                add_failure(DB_PATH, asset, start_ts, end_ts, note.strip(), user["username"])
+                _log.info("Parada registrada en %s por %s (%.2f h)", asset, user["username"], (end_ts - start_ts) / 3600)
+                st.success("Parada registrada.")
+            except ValueError as error:
+                st.error(str(error))
+    else:
+        st.caption("Tu rol solo permite consultar. Las paradas las registra el jefe de Mantenimiento.")
+    failures = list_failures(DB_PATH)
+    if failures.empty:
+        st.info("Aún no hay paradas registradas.")
+        return
+    table = failures.assign(
+        Inicio=failures["start_ts"].map(lambda t: datetime.fromtimestamp(t).strftime("%d/%m/%Y %H:%M")),
+        Fin=failures["end_ts"].map(lambda t: datetime.fromtimestamp(t).strftime("%d/%m/%Y %H:%M")),
+        **{"Duración (h)": ((failures["end_ts"] - failures["start_ts"]) / 3600).round(2)},
+    )[["asset", "Inicio", "Fin", "Duración (h)", "note", "username"]].rename(
+        columns={"asset": "Equipo", "note": "Causa", "username": "Registró"})
+    st.dataframe(table, hide_index=True, width="stretch")
+    st.download_button("⬇ Descargar paradas (CSV)", data=table.to_csv(index=False).encode("utf-8"), file_name="paradas.csv", mime="text/csv")
+
+
 def render_history(c):
+    _failure_form(c.user)
+
     st.markdown('<div class="section-title">Historial de decisiones</div>', unsafe_allow_html=True)
     st.caption("Cada decisión del jefe de Mantenimiento queda guardada con su fecha y usuario, aunque se cierre la aplicación.")
     decisions = list_decisions(DB_PATH)
@@ -2255,10 +2755,10 @@ def render_history(c):
         st.download_button("⬇ Descargar decisiones (CSV)", data=decisions.to_csv(index=False).encode("utf-8"),
                            file_name="decisiones.csv", mime="text/csv")
 
-    st.markdown('<div class="section-title">Intervenciones propuestas con datos reales</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Eventos del gemelo con datos reales</div>', unsafe_allow_html=True)
     events = list_events(DB_PATH)
     if events.empty:
-        st.info("Aún no hay intervenciones propuestas. Se registran automáticamente al analizar lecturas reales.")
+        st.info("Aún no hay eventos. Se registran automáticamente: intervenciones propuestas, alarmas del controlador y mantenimientos ejecutados.")
     else:
         equipment = st.selectbox("Equipo", ["Todos"] + sorted(events["Equipo"].unique()), key="history_asset")
         shown = events if equipment == "Todos" else events[events["Equipo"] == equipment]
@@ -2316,6 +2816,33 @@ def _thresholds_editor():
         st.rerun()
 
 
+def _gateway_panel():
+    st.markdown('<div class="section-title">Gateway MQTT y aprendizaje del perfil normal</div>', unsafe_allow_html=True)
+    status = get_gateway().status()
+    if status["configured"]:
+        st.write(f"Broker: `{status['host']}` · Tópicos: `{status['prefix']}/<equipo>/<variable>[/<punto>]` · "
+                 f"Estado: **{'conectado' if status['connected'] else 'sin conexión'}** · {status['accepted']:,} recibidas · {status['rejected']:,} descartadas")
+    else:
+        st.warning("Falta GEMELO_MQTT_HOST. Configura el broker con variables de entorno (ver README).")
+    rows = []
+    for asset_name, spec in ASSETS.items():
+        first, last, total = reading_span(DB_PATH, asset_name)
+        start = get_meta(DB_PATH, start_key(asset_name))
+        learned = get_meta(DB_PATH, baseline_key(asset_name))
+        fmt = lambda t: "—" if t is None else datetime.fromtimestamp(t).strftime("%d/%m/%Y %H:%M")
+        rows.append({"Equipo": f"{asset_name} ({spec['code'].lower()})", "Lecturas guardadas": total, "Primera": fmt(first), "Última": fmt(last),
+                     "Aprendizaje desde": fmt(start), "Perfil normal": "Aprendido" if learned else "Pendiente"})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption("El gemelo aprende el perfil normal con las primeras 4 horas desde «Aprendizaje desde». Esas horas deben ser de operación normal. "
+               "Reinicia el aprendizaje si el equipo estuvo degradado durante ese tramo o tras un cambio importante.")
+    asset_name = st.selectbox("Equipo", list(ASSETS.keys()), key="learn_asset")
+    if st.button("Reiniciar el aprendizaje ahora (el equipo está en condición normal)", key="learn_reset"):
+        restart_learning(DB_PATH, asset_name)
+        st.cache_data.clear()
+        _log.info("Aprendizaje del perfil normal de %s reiniciado", asset_name)
+        st.rerun()
+
+
 def _integrations():
     st.markdown('<div class="section-title">Notificaciones</div>', unsafe_allow_html=True)
     channels = channels_configured()
@@ -2340,6 +2867,7 @@ def _users_and_data():
 
 
 def render_admin(c):
+    _gateway_panel()
     _thresholds_editor()
     _integrations()
     _users_and_data()
@@ -2368,14 +2896,15 @@ def render_help(c):
     with tab_use:
         st.markdown(
             "**Operación diaria**\n"
-            "1. En la barra lateral elige el equipo y la fuente de datos (simulación o CSV de lecturas reales).\n"
+            "1. En la barra lateral elige el equipo y la fuente de datos (simulación o gateway MQTT con lecturas reales).\n"
             "2. **Telemetría** y **Réplica virtual** muestran el estado del equipo en el instante elegido.\n"
             "3. **Alertas** muestra las advertencias y la orden de trabajo que propone el gemelo. El jefe de Mantenimiento la aprueba o la rechaza.\n"
             "4. **Historial** conserva cada decisión con su fecha y usuario.\n"
             "5. **Indicadores** resume disponibilidad, MTBF y MTTR frente a las metas.\n\n"
-            "**Datos reales:** el CSV necesita una columna de tiempo y una columna por variable del equipo. "
-            "Descarga la plantilla desde la barra lateral. Las primeras 4 horas se usan para aprender el perfil normal del equipo, "
-            "así que deben corresponder a operación sin fallas.\n\n"
+            "**Datos reales:** el gateway publica las lecturas por MQTT y el gemelo las recibe y las guarda. "
+            "Las primeras 4 horas de lecturas se usan para aprender el perfil normal del equipo, así que deben corresponder a operación sin fallas. "
+            "Tras un mantenimiento, regístralo en Alertas y el gemelo vuelve a aprender.\n\n"
+            "**Fallas:** Mantenimiento registra cada parada en Historial; con ellas se calculan MTBF, MTTR y disponibilidad medidos.\n\n"
             "**Importante:** el gemelo es consultivo. No envía comandos a la máquina."
         )
         st.caption(f"Versión {APP_VERSION}")
@@ -2395,8 +2924,9 @@ RENDERERS = {
 }
 # Controles que viven dentro de una vista: se conservan al cambiar de vista (Streamlit descarta
 # el estado de los widgets que no se dibujan en una ejecución).
-VIEW_KEYS = ("p_prog", "min_lead_h", "history_asset", "admin_asset")
+VIEW_KEYS = ("p_prog", "min_lead_h", "history_asset", "admin_asset", "m_from", "m_to", "m_prog")
 MAX_LOGIN_ATTEMPTS = 5
+REFRESH_S = 30
 
 st.set_page_config(page_title=APP_TITLE, page_icon="⚙️", layout="wide", initial_sidebar_state="expanded")
 inject_css()
@@ -2469,23 +2999,20 @@ def build_context(ctl, user) -> SimpleNamespace:
         load_variability=ctl.load_pct / 100, compensate_load=ctl.compensate_load,
         inspection_h=ctl.inspection_eff, failure_mode=ctl.failure_mode, thresholds_id=fingerprint(ASSETS),
     )
-    data_id, duration, inspection_eff = "", float(ctl.duration), ctl.inspection_eff
+    live, duration, inspection_eff = None, float(ctl.duration), ctl.inspection_eff
     if is_real:
-        if ctl.csv_bytes is None:
-            st.info("Carga un CSV de lecturas en la barra lateral para analizar datos reales. Puedes descargar una plantilla con el formato esperado.")
-            st.stop()
         try:
-            df, alerts_df, idx = analyze_csv(ctl.csv_bytes, ctl.asset_name, ctl.intervention_threshold, sim.thresholds_id)
+            live = analyze_live(ctl.asset_name, ctl.intervention_threshold, sim.thresholds_id)
         except IngestError as error:
-            st.error(str(error))
+            st.info(str(error))
             st.stop()
-        data_id = data_fingerprint(ctl.csv_bytes)
+        df, alerts_df, idx = live.df, live.alerts, live.intervention_index
         df_re = df_pr = df
         alerts_re = alerts_pr = alerts_df
         idx_re, idx_pr = None, idx
         intervention_index = idx
         duration, inspection_eff = float(df["Hora simulada"].iloc[-1]), 0.0
-        register_proposal(ctl.asset_name, data_id, df, alerts_df, idx)
+        register_proposal(ctl.asset_name, live)
     else:
         df_re, alerts_re, idx_re = simulate_telemetry(sim, "Reactivo")
         df_pr, alerts_pr, idx_pr = simulate_telemetry(sim, "Predictivo")
@@ -2501,7 +3028,7 @@ def build_context(ctl, user) -> SimpleNamespace:
     projected_downtime = asset["scheduled_hours"] * (1 - projected_availability / 100)
 
     return SimpleNamespace(
-        user=user, is_real=is_real, data_id=data_id, sim=sim, asset=asset,
+        user=user, is_real=is_real, live=live, t0=live.t0 if live else None, sim=sim, asset=asset,
         df_re=df_re, alerts_re=alerts_re, idx_re=idx_re, df_pr=df_pr, alerts_pr=alerts_pr, idx_pr=idx_pr,
         df=df, alerts=alerts_df, intervention_index=intervention_index,
         operating=operating, base_mtbf=base_mtbf, base_mttr=base_mttr, base_availability=base_availability,
@@ -2519,7 +3046,7 @@ def build_context(ctl, user) -> SimpleNamespace:
 # Encabezado
 # ---------------------------------------------------------------------------
 def render_header(c) -> None:
-    subtitle = "con lecturas reales de sensores" if c.is_real else "con telemetría simulada"
+    subtitle = "con lecturas reales del gateway" if c.is_real else "con telemetría simulada"
     st.markdown(
         f"""
         <div class="hero">
@@ -2530,8 +3057,17 @@ def render_header(c) -> None:
         """,
         unsafe_allow_html=True,
     )
+    if c.is_real:
+        if c.live.learning:
+            st.info(f"El gemelo está aprendiendo el perfil normal del equipo (faltan {c.live.learn_remaining_h:.1f} h de lecturas). "
+                    "Mientras tanto muestra los datos y las alertas por umbral, pero no propone intervenciones.")
+        for note in c.live.notes:
+            st.warning(note)
+        stale_min = (time.time() - c.live.last_reading_ts) / 60
+        if stale_min > 15:
+            st.warning(f"Sin lecturas nuevas hace {stale_min:.0f} min. Revisa el gateway y la conexión con el broker.")
     hour_selected = st.slider(
-        "Instante a revisar (horas desde el inicio)", 0.0, float(c.duration), float(c.duration),
+        "Instante a revisar (horas desde el inicio de la ventana)", 0.0, float(c.duration), float(c.duration),
         step=1 / SAMPLES_PER_HOUR, format="%.2f h",
     )
     c.moment = int(min(max(round(hour_selected * SAMPLES_PER_HOUR), 0), len(c.df) - 1))
@@ -2540,7 +3076,7 @@ def render_header(c) -> None:
                     width="stretch", config=PLOTLY_CONFIG_BARE)
     st.caption("Franja de estado por política: verde = normal, amarillo = advertencia, rojo = crítico. ★ primera alerta; "
                "◆ intervención propuesta por el gemelo."
-               + (" Con datos reales ambas franjas muestran las mismas lecturas." if c.is_real else
+               + (" Con datos reales ambas franjas muestran las mismas lecturas. Hora 0 = " + datetime.fromtimestamp(c.t0).strftime("%d/%m/%Y %H:%M") + "." if c.is_real else
                   " Cambia al mover el escenario, el ruido, la pérdida de datos, el umbral o el método de detección."))
 
     c.status_now = str(c.df.iloc[c.moment]["Estado"])
@@ -2602,7 +3138,10 @@ def main() -> None:
     RENDERERS[view](ctx)       # solo se calcula y dibuja la vista activa
     render_config_download(controls)
     st.markdown("---")
-    st.caption(f"Gemelo digital consultivo · Fuente: {'datos reales' if ctx.is_real else 'datos simulados'} · v{APP_VERSION}")
+    st.caption(f"Gemelo digital consultivo · Fuente: {'gateway MQTT' if ctx.is_real else 'datos simulados'} · v{APP_VERSION}")
+    if ctx.is_real and controls.autorefresh:
+        time.sleep(REFRESH_S)
+        st.rerun()
 
 
 main()
