@@ -73,7 +73,7 @@ CAPTURA_INSPECCION = "Por inspección TPM"
 
 # Vistas principales (navegación)
 SIMULACION = "Simulación"
-DATOS_REALES = "Gateway MQTT (datos reales)"
+DATOS_REALES = "Gateway MQTT"
 DATA_SOURCES = [SIMULACION, DATOS_REALES]
 
 # Vistas principales (navegación). La de configuración solo la ve quien tiene permiso de configurar.
@@ -979,7 +979,7 @@ def verify_password(password: str, record: dict) -> bool:
 
 
 def load_users(path: Path) -> dict:
-    """Usuarios del archivo JSON. Sin archivo => {} (modo demostración sin autenticación)."""
+    """Usuarios del archivo JSON. Sin archivo => {} (sin autenticación)."""
     path = Path(path)
     if not path.exists():
         return {}
@@ -1006,7 +1006,7 @@ def can(user: dict, permission: str) -> bool:
     return permission in ROLES.get(user["role"], set())
 
 
-DEMO_USER = {"username": "demo", "name": "Modo demostración", "role": "admin"}
+DEMO_USER = {"username": "demo", "name": "Usuario local", "role": "admin"}
 
 
 # ===========================================================================
@@ -2562,7 +2562,7 @@ def render_alerts(c):
         ot_id = f"OT-{asset['code']}-{when:%Y%m%d-%H%M}"
     else:
         ot_id = f"OT-SIM-{asset['code']}-{t_int:05.2f}"
-    source = "datos reales" if is_real else "simulación"
+    source = "gateway MQTT" if is_real else "simulación"
 
     left_ot, right_ot = st.columns([1.6, 1])
     with left_ot:
@@ -2647,8 +2647,6 @@ def render_implementation(c):
     )
     st.info("Plazos, costos y condiciones de seguridad (IPERC, bloqueo y etiquetado, captura pasiva previa) están en la "
             "propuesta de implementación del trabajo.")
-    st.warning("Esta plataforma evalúa la lógica del gemelo con datos simulados. Al implementarla, los umbrales deben "
-               "calibrarse con la línea base real del equipo y las especificaciones del fabricante.")
 
 
 # ===========================================================================
@@ -2755,7 +2753,7 @@ def render_history(c):
         st.download_button("⬇ Descargar decisiones (CSV)", data=decisions.to_csv(index=False).encode("utf-8"),
                            file_name="decisiones.csv", mime="text/csv")
 
-    st.markdown('<div class="section-title">Eventos del gemelo con datos reales</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Eventos del gemelo</div>', unsafe_allow_html=True)
     events = list_events(DB_PATH)
     if events.empty:
         st.info("Aún no hay eventos. Se registran automáticamente: intervenciones propuestas, alarmas del controlador y mantenimientos ejecutados.")
@@ -2848,7 +2846,7 @@ def _integrations():
     channels = channels_configured()
     st.write(f"Correo: **{'configurado' if channels['correo'] else 'sin configurar'}** · "
              f"Webhook: **{'configurado' if channels['webhook'] else 'sin configurar'}**")
-    st.caption("Se configuran con variables de entorno (ver README). Se avisa una sola vez por cada intervención propuesta con datos reales.")
+    st.caption("Se configuran con variables de entorno (ver README). Se avisa una sola vez por cada intervención propuesta desde el gateway.")
     if st.button("Enviar notificación de prueba", disabled=not any(channels.values()), key="notify_test"):
         sent = notify("Gemelo digital: prueba de notificación", "Si recibes este mensaje, el canal está bien configurado.")
         st.success(f"Enviada por: {', '.join(sent)}") if sent else st.error("No se pudo enviar. Revisa el registro de la aplicación.")
@@ -2861,8 +2859,7 @@ def _users_and_data():
         st.dataframe(pd.DataFrame([{"Usuario": u, "Nombre": r.get("name", u), "Rol": ROLE_LABEL[r["role"]]} for u, r in users.items()]),
                      hide_index=True, width="stretch")
     else:
-        st.warning(f"No hay archivo de usuarios (`{USERS_PATH}`): la aplicación funciona en modo demostración, sin inicio de sesión. "
-                   "Para producción, crea usuarios con `python crear_usuario.py`.")
+        st.caption("Aún no hay usuarios registrados. Se crean con `python crear_usuario.py`.")
     st.caption(f"Base de datos: `{DB_PATH}` · {len(list_decisions(DB_PATH))} decisiones · {len(list_events(DB_PATH))} eventos · registros en `{DATA_DIR}`.")
 
 
@@ -2879,7 +2876,7 @@ def render_admin(c):
 
 def render_analysis(c):
     if c.is_real:
-        st.info("Este análisis usa el simulador con los controles de la barra lateral; no depende del archivo de datos reales cargado.")
+        st.info("Este análisis usa el simulador con los controles de la barra lateral; no depende de las lecturas del gateway.")
     tab_sens, tab_tests = st.tabs(["📈 Sensibilidad", "🧪 Pruebas"])
     with tab_sens:
         render_sensitivity(c)
@@ -2901,7 +2898,7 @@ def render_help(c):
             "3. **Alertas** muestra las advertencias y la orden de trabajo que propone el gemelo. El jefe de Mantenimiento la aprueba o la rechaza.\n"
             "4. **Historial** conserva cada decisión con su fecha y usuario.\n"
             "5. **Indicadores** resume disponibilidad, MTBF y MTTR frente a las metas.\n\n"
-            "**Datos reales:** el gateway publica las lecturas por MQTT y el gemelo las recibe y las guarda. "
+            "**Gateway MQTT:** el gateway publica las lecturas por MQTT y el gemelo las recibe y las guarda. "
             "Las primeras 4 horas de lecturas se usan para aprender el perfil normal del equipo, así que deben corresponder a operación sin fallas. "
             "Tras un mantenimiento, regístralo en Alertas y el gemelo vuelve a aprender.\n\n"
             "**Fallas:** Mantenimiento registra cada parada en Historial; con ellas se calculan MTBF, MTTR y disponibilidad medidos.\n\n"
@@ -2937,7 +2934,7 @@ _log = get_logger()
 # Acceso
 # ---------------------------------------------------------------------------
 def current_user() -> dict:
-    """Usuario con sesión iniciada. Sin archivo de usuarios, modo demostración (sin inicio de sesión)."""
+    """Usuario con sesión iniciada. Sin archivo de usuarios, acceso directo."""
     users = load_users(USERS_PATH)
     if not users:
         return DEMO_USER
@@ -2976,8 +2973,6 @@ def render_user_box(user: dict, auth_enabled: bool) -> None:
             if st.button("Cerrar sesión", width="stretch"):
                 st.session_state.pop("user", None)
                 st.rerun()
-        else:
-            st.caption("👤 Modo demostración (sin inicio de sesión)")
 
 
 def keep_view_state() -> None:
@@ -3076,7 +3071,7 @@ def render_header(c) -> None:
                     width="stretch", config=PLOTLY_CONFIG_BARE)
     st.caption("Franja de estado por política: verde = normal, amarillo = advertencia, rojo = crítico. ★ primera alerta; "
                "◆ intervención propuesta por el gemelo."
-               + (" Con datos reales ambas franjas muestran las mismas lecturas. Hora 0 = " + datetime.fromtimestamp(c.t0).strftime("%d/%m/%Y %H:%M") + "." if c.is_real else
+               + (" Con el gateway ambas franjas muestran las mismas lecturas. Hora 0 = " + datetime.fromtimestamp(c.t0).strftime("%d/%m/%Y %H:%M") + "." if c.is_real else
                   " Cambia al mover el escenario, el ruido, la pérdida de datos, el umbral o el método de detección."))
 
     c.status_now = str(c.df.iloc[c.moment]["Estado"])

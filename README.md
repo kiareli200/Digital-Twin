@@ -55,7 +55,7 @@ Publica 48 h de historia con degradación y sigue en tiempo real. Escenarios: `n
 
 ### Usuarios y roles
 
-Sin `users.json` la app corre en modo demostración (sin inicio de sesión). Para producción: `python crear_usuario.py` (roles `operador`, `jefe_mantenimiento`, `admin`).
+Sin `users.json` la app se abre sin inicio de sesión. Para producción: `python crear_usuario.py` (roles `operador`, `jefe_mantenimiento`, `admin`).
 
 ## Alcance y límites actuales
 
