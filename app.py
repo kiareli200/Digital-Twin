@@ -39,7 +39,34 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+# --- Tablas en HTML: reemplaza st.dataframe, que falla en Streamlit Cloud
+#     ("Failed to fetch dynamically imported module ... DataFrame.js") ---
+_ESTILO_TABLA = (
+    "<style>"
+    ".tabla-gemelo-wrap{max-height:440px;overflow:auto;border:1px solid rgba(255,255,255,.08);"
+    "border-radius:12px;margin-bottom:1rem;}"
+    ".tabla-gemelo{width:100%;border-collapse:collapse;font-size:.86rem;color:#e7eef7;}"
+    ".tabla-gemelo th{position:sticky;top:0;background:#0c1d2d;color:#91a4b8;text-align:left;"
+    "padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.12);}"
+    ".tabla-gemelo td{padding:7px 10px;border-bottom:1px solid rgba(255,255,255,.06);vertical-align:top;}"
+    ".tabla-gemelo tr:nth-child(even) td{background:rgba(255,255,255,.02);}"
+    "</style>"
+)
 
+
+def _numero(x):
+    return f"{x:,.3f}".rstrip("0").rstrip(".")
+
+
+def _tabla_html(data, hide_index=None, **_otros):
+    df = data if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
+    html = df.to_html(index=not hide_index, na_rep="—", border=0, classes="tabla-gemelo",
+                      float_format=_numero, justify="left")
+    st.markdown(_ESTILO_TABLA + '<div class="tabla-gemelo-wrap">' + html.replace("\n", "") + "</div>",
+                unsafe_allow_html=True)
+
+
+st.dataframe = _tabla_html
 
 # ===========================================================================
 # CONFIG
